@@ -113,6 +113,10 @@ def processar_arquivo(file_id: str, file_name: str, folder_num: int) -> bool:
             log.warning("Falha ao baixar %s", file_name)
             return False
 
+        if not isinstance(pdf_bytes, bytes):
+            log.error("pdf_bytes não é bytes para %s (tipo: %s)", file_name, type(pdf_bytes))
+            return False
+
         # Determinar nome novo
         if folder_num == 4:
             nome_banco = detectar_banco_pasta_04(file_name)
@@ -124,10 +128,16 @@ def processar_arquivo(file_id: str, file_name: str, folder_num: int) -> bool:
         else:
             nome_banco = None
 
-        nome_novo = determinar_nome_novo(folder_num, nome_banco, file_name, pdf_bytes)
+        try:
+            nome_novo = determinar_nome_novo(folder_num, nome_banco, file_name, pdf_bytes)
+        except Exception as e:
+            log.error("Erro ao determinar nome novo para %s: %s", file_name, traceback.format_exc())
+            notificar_arquivo_sem_dados(file_name, folder_num)
+            state_mgr.registrar_notificado(file_id, file_name, folder_num, f"Erro: {str(e)}")
+            return False
 
         if not nome_novo:
-            log.warning("Arquivo %s sem dados reconhecidos", file_name)
+            log.warning("Arquivo %s sem dados reconhecidos (nome_novo é None/vazio)", file_name)
             notificar_arquivo_sem_dados(file_name, folder_num)
             state_mgr.registrar_notificado(file_id, file_name, folder_num, "Sem dados")
             return False
@@ -267,17 +277,26 @@ async def _processar_mudancas() -> None:
         app_state.page_token = proximo_token
 
         if not novos:
-            log.info("Webhook recebido, nenhum PDF novo nas pastas monitoradas.")
+            log.debug("Webhook recebido, nenhum PDF novo nas pastas monitoradas.")
             return
 
         log.info("Encontrados %d arquivos novos", len(novos))
         total_processados = 0
         total_renomeados = 0
 
+        # Deduplica arquivos no mesmo ciclo (webhook pode chamar várias vezes)
+        processados_neste_ciclo = set()
+
         for arquivo in novos:
             file_id = arquivo["id"]
             file_name = arquivo["name"]
             folder_id = arquivo["folder_id"]
+
+            # Pular se já processado neste ciclo
+            if file_id in processados_neste_ciclo:
+                log.debug("Arquivo %s já processado neste ciclo, pulando", file_name)
+                continue
+            processados_neste_ciclo.add(file_id)
 
             # Determinar pasta número (1-4)
             folder_num = None
@@ -294,7 +313,9 @@ async def _processar_mudancas() -> None:
             if processar_arquivo(file_id, file_name, folder_num):
                 total_renomeados += 1
 
+        # Notificar APENAS se renomeou algo de verdade (não se tudo foi ??  ou erro)
         if total_renomeados > 0:
+            log.info("Notificando sucesso: %d renomeados de %d", total_renomeados, total_processados)
             await asyncio.to_thread(
                 notificar_sucesso_ciclo, total_processados, total_renomeados
             )
