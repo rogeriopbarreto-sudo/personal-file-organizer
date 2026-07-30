@@ -82,44 +82,77 @@ def parse_pasta_01_btg_notas(pdf_bytes: bytes) -> NotaBTG:
         return NotaBTG(None, None, None, None)
 
     nota = NotaBTG(None, None, None, None)
+    linhas = texto.split("\n")
 
-    # Data da operação: procurar por linha com padrão "Data da Operação: DD/MM/YYYY" ou similar
-    for linha in texto.split("\n"):
-        # Flexível: procura "operação" com números
-        if "operação" in linha.lower() or "data" in linha.lower():
-            # Procura DD/MM/YYYY
+    # Data da operação: procurar "Data da Operação" + DD/MM/YYYY
+    for linha in linhas:
+        if "data da operação" in linha.lower():
             match = re.search(r"(\d{2})/(\d{2})/(\d{4})", linha)
             if match:
-                # Extrai mês e dia
                 nota.data = f"{match.group(2)}-{match.group(1)}"
                 break
 
     # Tipo de operação: buscar "Compra", "Venda" ou "Juros"
-    for linha in texto.split("\n"):
-        if re.search(r"\b(Compra|Venda|Juros)\b", linha):
-            match = re.search(r"\b(Compra|Venda|Juros)\b", linha)
-            if match:
-                nota.tipo_op = match.group(1)
-                break
-
-    # Ativo: procurar por código/nome do papel (complexo, heurístico)
-    # Padrão: linha com maiúsculas, dígitos, números
-    for linha in texto.split("\n"):
-        linha = linha.strip()
-        # Ativo pode ser algo como "NTN-B1", "PEJA11", "CDCA-24G02736845"
-        if re.search(r"[A-Z0-9]{2,}", linha) and len(linha) < 30:
-            # Tenta achar entre aspas ou parênteses, ou isolado
-            match = re.search(r"([A-Z][A-Z0-9-]{2,})", linha)
-            if match:
-                nota.ativo = match.group(1)
-                break
-
-    # Valor: buscar valor em formato R$ X.XXX,XX ou similar
-    for linha in texto.split("\n"):
-        match = re.search(r"R\$\s*([\d.]+,\d{2})", linha)
+    for linha in linhas:
+        match = re.search(r"\b(Compra|Venda|Juros)\b", linha)
         if match:
-            nota.valor = f"R${match.group(1)}"
+            nota.tipo_op = match.group(1)
             break
+
+    # Ativo: procurar na seção "Características dos Títulos"
+    # Procura linha com "Título" e extrai o código (ex: "DEB - ENEVB0")
+    encontrou_titulo = False
+    for i, linha in enumerate(linhas):
+        if "título" in linha.lower() and "características" in linhas[max(0, i-1)].lower():
+            encontrou_titulo = True
+            continue
+        if encontrou_titulo:
+            # Próxima linha com conteúdo deve ter o código do ativo
+            linha_strip = linha.strip()
+            if linha_strip and not linha_strip.lower().startswith("emitente"):
+                # Procura padrão como "DEB - ENEVB0" ou só "ENEVB0"
+                match = re.search(r"([A-Z][A-Z0-9-]{2,})", linha_strip)
+                if match:
+                    nota.ativo = match.group(1)
+                    break
+
+    # Se não achou pelo método acima, tentar heurística mais simples
+    if not nota.ativo:
+        for linha in linhas:
+            linha_strip = linha.strip()
+            # Procura por linhas que têm exatamente um código de ativo (4-10 chars, maiúsculas, dígitos, hífen)
+            if re.match(r"^[A-Z][A-Z0-9-]{2,10}$", linha_strip):
+                # Evita palavras genéricas como IMPORTANTE, OBSERVAÇÕES, etc
+                if linha_strip not in ("IMPORTANTE", "OBSERVAÇÕES", "CARACTERÍSTICAS", "OPERAÇÕES"):
+                    nota.ativo = linha_strip
+                    break
+
+    # Valor Líquido: buscar na seção "Características da Operação" ou "Valor Líquido"
+    # Padrão: "Valor Líquido" seguido de número em formato BR (X.XXX,XX)
+    encontrou_valor = False
+    for i, linha in enumerate(linhas):
+        if "valor líquido" in linha.lower():
+            # Procura número nesta linha ou próximas
+            match = re.search(r"([\d.]+,\d{2})", linha)
+            if match:
+                nota.valor = f"R${match.group(1)}"
+                encontrou_valor = True
+                break
+            # Tenta próxima linha
+            if i + 1 < len(linhas):
+                match = re.search(r"([\d.]+,\d{2})", linhas[i + 1])
+                if match:
+                    nota.valor = f"R${match.group(1)}"
+                    encontrou_valor = True
+                    break
+
+    # Se ainda não achou, tenta procurar qualquer valor R$ (fallback)
+    if not nota.valor:
+        for linha in linhas:
+            match = re.search(r"([\d.]+,\d{2})", linha)
+            if match and float(match.group(1).replace(".", "").replace(",", ".")) > 100:
+                nota.valor = f"R${match.group(1)}"
+                break
 
     return nota
 
