@@ -1,100 +1,95 @@
 # Personal File Organizer
 
-Automação de renomeação de PDFs no Google Drive — notas BTG, extratos, faturas de banco. Roda 24/7 numa VPS (Coolify) com webhook do Google Drive (notificação quase imediata de mudanças).
+Renomeia automaticamente os PDFs financeiros no Google Drive — notas de negociação BTG, relatórios de performance, extratos e faturas de banco. Roda 24/7 numa VPS (Coolify) e reage em segundos, via webhook do Google Drive.
 
-## Setup Local (Teste)
+## Como funciona
 
-### Pré-requisitos
+1. Um PDF chega numa das pastas monitoradas.
+2. O Drive chama `POST /drive-webhook`.
+3. O serviço lista as mudanças, baixa o PDF, extrai os campos e renomeia.
+4. Cada resultado vira uma mensagem no Telegram.
 
-- Python 3.12+
-- `poppler-utils` (para `pdftotext`)
-- Variáveis de ambiente (copiar de `.env.example` para `.env`)
+No boot também roda uma **varredura completa** das pastas, para recuperar o que tenha chegado com o serviço fora do ar.
 
-### Instalação
+### Detalhes que importam
+
+- **Rajada de webhooks.** O Drive dispara várias notificações por upload. As varreduras são serializadas por um lock e agrupadas por um debounce — sem isso o mesmo arquivo é processado N vezes e o Telegram enche.
+- **Extração por coluna.** As notas do BTG são tabelas: com `pdftotext -layout`, o cabeçalho `Valor Líquido` fica numa linha e o valor numa linha seguinte, na mesma posição horizontal. Procurar `valor líquido\s+N` por regex nunca funciona — o valor é localizado por alinhamento de coluna.
+- **Nunca sobrescreve.** Se o nome de destino já existe, ganha sufixo `(2)`, `(3)`...
+- **`DRY_RUN` não "queima" arquivos.** O cache marca o registro como simulação, então ao desligar o `DRY_RUN` os arquivos são renomeados de verdade.
+- **Banco vem da subpasta.** Na Pasta 04 o banco é o nome da subpasta (`BTG`, `Itau`), não um palpite pelo nome do arquivo. Subpasta nova passa a funcionar sozinha.
+- **PDF com senha** vira aviso no Telegram, não erro silencioso.
+
+## Padrões de nome
+
+| Pasta | Padrão |
+| :---- | :----- |
+| 01 — Notas de Corretagem | `MM-DD - Ativo - TipoOp - R$Valor.pdf` |
+| 02 — Performance | `AA-MM-DD - Performance - AA-MM - AA-MM.pdf` |
+| 03 — Extrato Investimentos | `AAAA-MM.pdf` |
+| 04 — Banking | `AAAA-MM - Banco.pdf` ou `AA-MM - AA-MM - Banking.pdf` |
+
+Campo não reconhecido vira `??`. Se **nenhum** campo for reconhecido, o arquivo não é renomeado — só gera aviso.
+
+## Variáveis de ambiente
+
+Copiar `.env.example` para `.env`. Obrigatórias:
+
+- `GOOGLE_SERVICE_ACCOUNT_JSON` — credencial completa do service account
+- `DRIVE_FOLDER_01..04` — IDs das pastas
+- `WEBHOOK_BASE_URL` — **precisa ser HTTPS** (o Google recusa HTTP)
+- `WEBHOOK_TOKEN` — string aleatória que autentica as chamadas do Drive
+- `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`
+
+Opcionais: `DRY_RUN`, `WEBHOOK_DEBOUNCE_SECONDS`, `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`, `USAR_LLM_FALLBACK`, `STATE_DIR`, `LOG_LEVEL`.
+
+## Endpoints
+
+| Rota | O que faz |
+| :--- | :-------- |
+| `GET /` | Health check com contadores (varreduras, renomeados, último erro) |
+| `POST /drive-webhook` | Recebe as notificações do Drive |
+| `POST /varrer` | Varredura manual — exige o header `x-token: $WEBHOOK_TOKEN` |
+
+Forçar uma varredura completa (útil logo depois de desligar o `DRY_RUN`):
 
 ```bash
-pip install -r requirements.txt
+curl -X POST https://SEU-HOST/varrer -H "x-token: SEU_TOKEN"
 ```
 
-### Variáveis de Ambiente
-
-Copiar `.env.example` para `.env` e preencher:
+## Rodando local
 
 ```bash
-cp .env.example .env
+pip install -r requirements.txt          # precisa também do poppler-utils
+cp .env.example .env                     # preencher
+uvicorn app.main:app --reload
 ```
 
-**Variáveis obrigatórias:**
-- `GOOGLE_SERVICE_ACCOUNT_JSON` — credencial JSON do service account (completa)
-- `DRIVE_FOLDER_01`, `DRIVE_FOLDER_02`, `DRIVE_FOLDER_03`, `DRIVE_FOLDER_04` — IDs das pastas do Drive
-- `ANTHROPIC_API_KEY` — chave da Anthropic API
-- `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` — credenciais do bot Telegram
-- `WEBHOOK_BASE_URL` — URL pública onde o Drive pode chamar (ex: `http://localhost:8000` pra teste local, `https://organizer.barreto.ai` em produção)
-- `WEBHOOK_TOKEN` — string aleatória pra validar notificações do Drive
+Para o webhook funcionar local é preciso um túnel HTTPS público (ex.: `ngrok http 8000`) e apontar `WEBHOOK_BASE_URL` para a URL gerada. Sem túnel, o serviço sobe e a varredura do boot funciona, mas não chega notificação.
 
-### Executar (teste local)
+## Testes
 
 ```bash
-export DRY_RUN=true  # Testar sem fazer rename real
-uvicorn app.main:app --reload  # Roda o servidor FastAPI
+python app/tests/test_regressao_parser.py
 ```
 
-Com `DRY_RUN=true`, o script loga o que _teria_ feito sem modificar nenhum arquivo.
+Roda o parser contra os PDFs reais já renomeados e compara com o nome atual de cada arquivo — que é o ground truth. Exige a pasta do Drive sincronizada localmente (ou `PFO_PASTA_RAIZ` apontando para ela).
 
-### Webhook Local (para teste)
+## Estrutura
 
-Se quiser testar o webhook localmente (sem expor porta pública):
+| Arquivo | Responsabilidade |
+| :------ | :--------------- |
+| `config.py` | Variáveis de ambiente e validação |
+| `drive_client.py` | Auth, webhook, listagem, download, rename, colisão de nome |
+| `parser.py` | Extração determinística por pasta (sem rede — testável offline) |
+| `llm_fallback.py` | Último recurso via Anthropic, com validação de formato |
+| `notifier.py` | Telegram (stdlib), com anti-flood |
+| `state.py` | Cache persistente do que já foi processado |
+| `main.py` | FastAPI, webhook, lock/debounce e orquestração |
 
-1. Usar ngrok ou similar pra criar um túnel público: `ngrok http 8000`
-2. Copiar a URL pública gerada
-3. Setar `WEBHOOK_BASE_URL=https://xxx.ngrok.io` antes de rodar
-4. Webhook vai funcionar (Drive vai chamar sua URL pública)
+## Problemas comuns
 
-## Deploy no Coolify
-
-1. Criar um repositório GitHub novo (`personal-file-organizer`).
-2. Subir este código pro repo.
-3. Seguir `COOLIFY_SETUP.md` deste workspace para:
-   - Criar resource no Coolify
-   - Configurar porta 8000 como exposta
-   - Adicionar variáveis de env (especialmente `WEBHOOK_BASE_URL` e `WEBHOOK_TOKEN`)
-   - Criar volume persistente em `/app/state`
-   - Deploy
-4. Rodar com `DRY_RUN=true` por alguns dias, monitorar logs e alertas Telegram.
-5. Quando confiante, trocar para `DRY_RUN=false` e deixar rodar.
-
-## Regras de Parsing
-
-Veja `instrucoes-claude-code-organizador-drive.md` (no workspace raiz) para as regras exatas de renomeação por pasta. O resumo:
-
-- **Pasta 01 (BTG Notas):** `MM-DD - Ativo - TipoOp - R$Valor.pdf`
-- **Pasta 02 (Performance):** `yy-mm-dd - Performance - yy-mm - yy-mm.pdf`
-- **Pasta 03 (Extratos):** `yyyy-mm.pdf`
-- **Pasta 04 (Banking):** `yyyy-mm - NomeDoBanco.pdf` ou `yy-mm - yy-mm - Banking.pdf`
-
-## Estrutura do Código
-
-- **config.py** — Settings via env vars
-- **drive_client.py** — autenticação (service account) + webhook + list/download/rename no Drive
-- **parser.py** — regras determinísticas de parsing por pasta + regex
-- **llm_fallback.py** — chamada à Anthropic API para campos ambíguos
-- **notifier.py** — notificações via Telegram (stdlib, sem `requests`)
-- **state.py** — cache persistente em JSON (não notifica 2x o mesmo arquivo)
-- **main.py** — FastAPI + webhook + orquestração
-
-## Logs
-
-O script loga em INFO por padrão (útil pra ver notificações de webhook, renames, erros). Trocar `logging.basicConfig(level=logging.INFO)` em `main.py` para `DEBUG` se precisar mais verbosidade.
-
-## Troubleshooting
-
-- **"pdftotext não encontrado"** — instalar `poppler-utils` (`apt-get install poppler-utils` no Linux, `brew install poppler` no Mac)
-- **Erro de autenticação Drive** — verificar se o service account tem acesso às pastas (compartilhar como Editor)
-- **Webhook não registra no Drive** — verificar se `WEBHOOK_BASE_URL` é público e acessível
-- **Arquivo não renomeado, mas parecia válido** — checar logs; se campo obrigatório não foi reconhecido, vai pra Telegram
-
-## Próximos Passos
-
-- Melhorar detecção de banco em Pasta 04 (atualmente heurística no nome do arquivo)
-- Implementar lógica de duplicata em Pasta 03 (comparar hash/tamanho)
-- Adicionar testes unitários (`pytest`)
+- **`WebHook callback must be HTTPS`** — `WEBHOOK_BASE_URL` está em HTTP. Configure um domínio com TLS.
+- **Nada acontece ao subir um arquivo** — o Drive só notifica mudanças *reais*; re-subir um arquivo idêntico que já está lá pode não gerar evento. Use `POST /varrer`.
+- **`pdftotext não encontrado`** — falta `poppler-utils` (já vem no Dockerfile).
+- **Erro de permissão no rename** — as pastas precisam estar compartilhadas como **Editor** com o e-mail do service account.

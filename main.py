@@ -1,231 +1,354 @@
-"""FastAPI: recebe webhook do Google Drive e processa organização de arquivos.
+"""FastAPI: recebe o webhook do Google Drive e renomeia os PDFs novos.
 
-Fluxo: Drive detecta mudança → chama POST /drive-webhook → listamos as mudanças desde
-o último page_token → processamos PDFs novos (renomear ou notificar) → registramos em state.
+Fluxo: alguém sobe um PDF → o Drive chama POST /drive-webhook → listamos as
+mudanças desde o último page_token → cada PDF novo dentro das pastas monitoradas
+é lido, parseado e renomeado (ou vira aviso no Telegram).
 
-Não há agendamento: o único jeito de algo rodar aqui é o Drive avisar (ou o boot, que
-registra o canal de notificação).
+Não há agendamento: só roda quando o Drive avisa (ou no boot, que registra o
+canal de notificação).
+
+Detalhe importante: o Drive dispara VÁRIAS notificações por upload. Por isso as
+varreduras são serializadas por um lock e agrupadas por um debounce — sem isso
+uma dúzia de tarefas concorrentes processa o mesmo arquivo e enche o Telegram.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-import logging.config
+import os
 import time
 import traceback
+from contextlib import asynccontextmanager
 
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Response
 
-from . import drive_client
+from . import drive_client as drive
+from . import notifier, state
 from .config import settings
-from .drive_client import Channel, download_pdf, rename_file
-from .notifier import (
-    notificar_arquivo_sem_dados,
-    notificar_banco_novo,
-    notificar_duplicata_suspeita,
-    notificar_erro_autenticacao,
-    notificar_pdf_protegido,
-    notificar_sucesso_ciclo,
-)
-from .parser import (
-    determinar_nome_novo,
-    parse_pasta_04_banking_btg,
-    parse_pasta_04_banking_itau,
-    valida_padrão_final,
-)
+from .llm_fallback import completar_campos
+from .parser import PdfProtegido, determinar_nome_novo, valida_padrão_final
 from .state import get_state_manager
 
-# ============================================================================
-# Logging
-# ============================================================================
-
-LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 logging.basicConfig(
-    level=logging.INFO,
-    format=LOG_FORMAT,
+    level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 log = logging.getLogger("file_organizer.main")
 
-# ============================================================================
-# FastAPI App
-# ============================================================================
-
-app = FastAPI(title="personal-file-organizer")
-
-# Renovação de canal 12h antes de expirar
+# Renova o canal com folga antes de expirar (o Drive dá ~7 dias).
 RENOVAR_COM_ANTECEDENCIA_MS = 12 * 60 * 60 * 1000
+INTERVALO_CHECAGEM_CANAL_S = 60 * 60
 
 
-# ============================================================================
-# Estado global
-# ============================================================================
+class Estado:
+    """Estado compartilhado do processo."""
 
-class AppState:
-    """Estado compartilhado entre requests."""
-
-    def __init__(self):
+    def __init__(self) -> None:
         self.page_token: str | None = None
-        self.channel: Channel | None = None
-        self.pastas_monitoradas = {
-            1: settings.drive_folder_01,
-            2: settings.drive_folder_02,
-            3: settings.drive_folder_03,
-            4: settings.drive_folder_04,
-        }
-        self.bancos_conhecidos = {
-            "BTG": parse_pasta_04_banking_btg,
-            "Itau": parse_pasta_04_banking_itau,
-        }
-        # Global lock pra evitar processamento paralelo do mesmo arquivo
-        self.processando_ids: set[str] = set()
+        self.channel: drive.Channel | None = None
+        self.lock = asyncio.Lock()
+        self.pendente = False
+        self.completa_pendente = False
+        self.varreduras = 0
+        self.renomeados = 0
+        self.ultimo_erro: str | None = None
 
 
-app_state = AppState()
+estado = Estado()
 
 
 # ============================================================================
-# Processamento de arquivo (reutilizado do código antigo)
+# Mapa das pastas monitoradas
 # ============================================================================
 
 
-def processar_arquivo(file_id: str, file_name: str, folder_num: int) -> bool:
-    """Processa um arquivo: baixa, parseia, renomeia (ou notifica).
+def _mapa_pastas() -> dict[str, tuple[int, str | None]]:
+    """folder_id → (número da pasta, nome do banco).
 
-    Retorna True se processado com sucesso, False se erro/ambíguo.
+    A Pasta 04 guarda os extratos em subpastas por banco (BTG, Itau), então o
+    banco vem da subpasta — não de heurística no nome do arquivo. A lista é
+    relida a cada varredura, então um banco novo passa a funcionar sozinho.
     """
-    state_mgr = get_state_manager()
+    mapa: dict[str, tuple[int, str | None]] = {}
+    for numero, folder_id in (
+        (1, settings.drive_folder_01),
+        (2, settings.drive_folder_02),
+        (3, settings.drive_folder_03),
+        (4, settings.drive_folder_04),
+    ):
+        if folder_id:
+            mapa[folder_id] = (numero, None)
 
-    # Se já visto, pular
-    if state_mgr.ja_visto(file_id):
-        log.debug("Arquivo %s já visto, pulando", file_name)
-        return True
+    for subpasta in drive.listar_subpastas(settings.drive_folder_04):
+        mapa[subpasta.id] = (4, subpasta.name)
 
-    # Checar se nome já está no padrão final (idempotência)
-    if valida_padrão_final(folder_num, file_name):
-        log.info("Arquivo %s já está no padrão final, pulando", file_name)
-        state_mgr.registrar_sucesso(file_id, file_name, folder_num)
-        return True
+    return mapa
 
-    log.info("Processando %s (pasta %d)", file_name, folder_num)
 
-    try:
-        # Baixar PDF
-        pdf_bytes = download_pdf(file_id)
-        if not pdf_bytes:
-            log.warning("Falha ao baixar %s", file_name)
-            return False
+# ============================================================================
+# Processamento de um arquivo
+# ============================================================================
 
-        if not isinstance(pdf_bytes, bytes):
-            log.error("pdf_bytes não é bytes para %s (tipo: %s)", file_name, type(pdf_bytes))
-            return False
 
-        # Determinar nome novo
-        if folder_num == 4:
-            nome_banco = detectar_banco_pasta_04(file_name)
-            if not nome_banco:
-                log.warning("Não conseguiu detectar banco para %s", file_name)
-                notificar_banco_novo("Desconhecido", file_name)
-                state_mgr.registrar_notificado(file_id, file_name, folder_num, "Banco desconhecido")
-                return False
-        else:
-            nome_banco = None
+def _processar(
+    file_id: str, nome_atual: str, pasta_id: str, numero: int, banco: str | None
+) -> bool:
+    """Processa um arquivo. Retorna True se renomeou (ou simulou o rename)."""
+    gerenciador = get_state_manager()
+    simulacao = settings.dry_run
 
-        try:
-            nome_novo = determinar_nome_novo(folder_num, nome_banco, file_name, pdf_bytes)
-        except Exception as e:
-            log.error("Erro ao determinar nome novo para %s: %s", file_name, traceback.format_exc())
-            notificar_arquivo_sem_dados(file_name, folder_num)
-            state_mgr.registrar_notificado(file_id, file_name, folder_num, f"Erro: {str(e)}")
-            return False
-
-        if not nome_novo:
-            log.warning("Arquivo %s sem dados reconhecidos (nome_novo é None/vazio)", file_name)
-            notificar_arquivo_sem_dados(file_name, folder_num)
-            state_mgr.registrar_notificado(file_id, file_name, folder_num, "Sem dados")
-            return False
-
-        # Checar duplicata (Pasta 03)
-        if folder_num == 3:
-            resultado = verificar_duplicata_pasta_03(file_id, file_name, nome_novo)
-            if resultado == "duplicata":
-                return False
-            elif resultado == "mesmo_arquivo":
-                state_mgr.registrar_sucesso(file_id, file_name, folder_num)
-                return True
-
-        # Renomear (se DRY_RUN, só logar)
-        if settings.dry_run:
-            log.info("[DRY_RUN] Teria renomeado: %s → %s", file_name, nome_novo)
-        else:
-            rename_file(file_id, nome_novo)
-            log.info("Renomeado com sucesso: %s → %s", file_name, nome_novo)
-
-        state_mgr.registrar_sucesso(file_id, file_name, folder_num)
-        return True
-
-    except Exception as e:
-        log.error("Erro ao processar %s: %s", file_name, traceback.format_exc())
+    # Já está no padrão final → nada a fazer (idempotência).
+    if valida_padrão_final(numero, nome_atual):
+        log.info("Já no padrão final, ignorando: %s", nome_atual)
+        gerenciador.registrar(
+            file_id, nome_atual, numero, state.SUCESSO, motivo="já no padrão"
+        )
         return False
 
+    if numero == 4 and not banco:
+        log.warning("Arquivo na raiz da Pasta 04, sem banco: %s", nome_atual)
+        notifier.notificar_banco_desconhecido(nome_atual)
+        gerenciador.registrar(
+            file_id, nome_atual, numero, state.SEM_DADOS, motivo="banco desconhecido"
+        )
+        return False
 
-def detectar_banco_pasta_04(file_name: str) -> str | None:
-    """Detecta banco pela heurística no nome do arquivo."""
-    if "itau" in file_name.lower():
-        return "Itau"
-    elif "btg" in file_name.lower() or "banco" in file_name.lower():
-        return "BTG"
-    else:
-        return None
-
-
-def verificar_duplicata_pasta_03(file_id: str, file_name: str, nome_novo: str) -> str | None:
-    """Verifica se arquivo é uma possível duplicata (Pasta 03 apenas)."""
-    # TODO: implementar lógica de comparar tamanho/hash
-    return "ok"
-
-
-# ============================================================================
-# Lifecycle
-# ============================================================================
-
-
-@app.on_event("startup")
-async def startup() -> None:
-    """Ao iniciar, registra o canal de notificação e pega o page_token inicial."""
-    faltando = settings.validar()
-    if faltando:
-        log.error("Variáveis de ambiente faltando: %s — organizador não vai registrar o canal.", faltando)
-        return
+    log.info("Processando %s (pasta %d%s)", nome_atual, numero, f"/{banco}" if banco else "")
 
     try:
-        app_state.page_token = drive_client.get_start_page_token()
-        folder_ids = [
-            app_state.pastas_monitoradas[i] for i in range(1, 5)
-            if app_state.pastas_monitoradas[i]
-        ]
-        app_state.channel = drive_client.start_watch(app_state.page_token)
-        asyncio.create_task(_renovar_canal_periodicamente())
-        log.info("Organizador iniciado — canal de notificações registrado")
+        pdf = drive.download_pdf(file_id)
     except Exception as e:
-        log.error("Falha ao iniciar: %s", traceback.format_exc())
-        notificar_erro_autenticacao()
+        log.exception("Falha ao baixar %s", nome_atual)
+        gerenciador.registrar(file_id, nome_atual, numero, state.ERRO, motivo=str(e)[:200])
+        notifier.notificar_erro(f"download de {nome_atual}", str(e))
+        return False
+
+    try:
+        resultado = determinar_nome_novo(
+            numero, banco, nome_atual, pdf, completar=completar_campos
+        )
+    except PdfProtegido:
+        log.warning("PDF protegido por senha: %s", nome_atual)
+        notifier.notificar_pdf_protegido(nome_atual, numero)
+        gerenciador.registrar(
+            file_id, nome_atual, numero, state.PROTEGIDO, motivo="PDF exige senha"
+        )
+        return False
+    except Exception as e:
+        log.exception("Falha ao parsear %s", nome_atual)
+        gerenciador.registrar(file_id, nome_atual, numero, state.ERRO, motivo=str(e)[:200])
+        notifier.notificar_erro(f"parsing de {nome_atual}", str(e))
+        return False
+
+    if resultado.nome is None:
+        log.warning("Nenhum campo reconhecido em %s", nome_atual)
+        notifier.notificar_arquivo_sem_dados(nome_atual, numero)
+        gerenciador.registrar(
+            file_id, nome_atual, numero, state.SEM_DADOS, motivo="nenhum campo reconhecido"
+        )
+        return False
+
+    if resultado.nome == nome_atual:
+        gerenciador.registrar(file_id, nome_atual, numero, state.SUCESSO, motivo="nome já correto")
+        return False
+
+    # Nunca sobrescreve: se o destino existe, ganha sufixo (2), (3)...
+    nome_final = drive.nome_sem_colisao(pasta_id, resultado.nome, ignorar_id=file_id)
+
+    if simulacao:
+        log.info("[DRY_RUN] Renomearia: %s → %s", nome_atual, nome_final)
+    else:
+        drive.rename_file(file_id, nome_final)
+        log.info("Renomeado: %s → %s", nome_atual, nome_final)
+
+    if resultado.campos_faltando:
+        notifier.notificar_campos_faltando(
+            nome_atual, nome_final, numero, resultado.campos_faltando, simulacao
+        )
+        status = state.INCOMPLETO
+    else:
+        notifier.notificar_renomeado(nome_atual, nome_final, numero, simulacao)
+        status = state.SUCESSO
+
+    gerenciador.registrar(
+        file_id,
+        nome_atual,
+        numero,
+        status,
+        motivo=", ".join(resultado.campos_faltando),
+        nome_novo=nome_final,
+        dry_run=simulacao,
+    )
+    return True
+
+
+# ============================================================================
+# Varredura (síncrona — roda numa thread, serializada pelo lock)
+# ============================================================================
+
+
+def _varrer_tudo(mapa: dict[str, tuple[int, str | None]]) -> None:
+    """Percorre as pastas inteiras, não só as mudanças recentes.
+
+    Roda no boot: as notificações do Drive só valem a partir do momento em que o
+    canal é registrado, então um arquivo que chegou com o serviço fora do ar
+    nunca seria visto. Arquivos já no padrão final são descartados antes de
+    qualquer download, então a varredura é barata.
+    """
+    gerenciador = get_state_manager()
+    log.info("Varredura completa das pastas monitoradas")
+
+    for pasta_id, (numero, banco) in mapa.items():
+        for arquivo in drive.listar_pdfs(pasta_id):
+            if valida_padrão_final(numero, arquivo.name):
+                continue
+            if not gerenciador.precisa_processar(arquivo.id, settings.dry_run):
+                continue
+            try:
+                if _processar(arquivo.id, arquivo.name, pasta_id, numero, banco):
+                    estado.renomeados += 1
+            except Exception as e:
+                estado.ultimo_erro = traceback.format_exc()
+                log.exception("Erro inesperado em %s", arquivo.name)
+                notifier.notificar_erro(arquivo.name, str(e))
+
+
+def _varrer(completa: bool = False) -> None:
+    """Lê as mudanças desde o último page_token e processa os PDFs novos."""
+    gerenciador = get_state_manager()
+    mapa = _mapa_pastas()
+
+    if completa:
+        _varrer_tudo(mapa)
+
+    novos, proximo_token = drive.listar_mudancas(estado.page_token)
+    estado.page_token = proximo_token
+    estado.varreduras += 1
+
+    if not novos:
+        log.debug("Varredura sem PDFs novos")
+        return
+
+    ja_vistos: set[str] = set()
+    for arquivo in novos:
+        file_id = arquivo["id"]
+        if file_id in ja_vistos:
+            continue
+        ja_vistos.add(file_id)
+
+        # Em qual pasta monitorada esse arquivo está?
+        destino = next(
+            ((pai, mapa[pai]) for pai in arquivo["parents"] if pai in mapa), None
+        )
+        if destino is None:
+            continue
+        pasta_id, (numero, banco) = destino
+
+        if not gerenciador.precisa_processar(file_id, settings.dry_run):
+            log.debug("Já processado, ignorando: %s", arquivo["name"])
+            continue
+
+        try:
+            if _processar(file_id, arquivo["name"], pasta_id, numero, banco):
+                estado.renomeados += 1
+        except Exception as e:
+            estado.ultimo_erro = traceback.format_exc()
+            log.exception("Erro inesperado em %s", arquivo["name"])
+            notifier.notificar_erro(arquivo["name"], str(e))
+
+
+async def _disparar_varredura(completa: bool = False) -> None:
+    """Agenda uma varredura, agrupando a rajada de notificações do Drive.
+
+    O Drive manda várias notificações por upload. O lock garante uma varredura
+    por vez e o debounce junta a rajada; se chegar aviso durante a varredura, o
+    laço roda de novo. Todo pedido passa por aqui — inclusive a varredura
+    completa do boot — para nunca haver duas varreduras simultâneas.
+    """
+    if completa:
+        estado.completa_pendente = True
+    estado.pendente = True
+    if estado.lock.locked():
+        return  # quem está com o lock vai enxergar o pedido e rodar de novo
+
+    async with estado.lock:
+        while estado.pendente:
+            await asyncio.sleep(settings.webhook_debounce_seconds)
+            # A partir daqui, avisos novos pedem outra rodada.
+            estado.pendente = False
+            fazer_completa = estado.completa_pendente
+            estado.completa_pendente = False
+            try:
+                await asyncio.to_thread(_varrer, fazer_completa)
+            except Exception as e:
+                estado.ultimo_erro = traceback.format_exc()
+                log.exception("Erro na varredura")
+                notifier.notificar_erro("varredura", str(e))
+
+
+# ============================================================================
+# Ciclo de vida
+# ============================================================================
 
 
 async def _renovar_canal_periodicamente() -> None:
-    """Renova o canal de notificação a cada hora, se necessário."""
+    """Renova o canal do Drive antes de expirar."""
     while True:
-        await asyncio.sleep(60 * 60)  # confere de hora em hora
-        if not app_state.channel:
+        await asyncio.sleep(INTERVALO_CHECAGEM_CANAL_S)
+        if not estado.channel or not estado.page_token:
             continue
-        restante = app_state.channel.expiration_ms - int(time.time() * 1000)
-        if restante < RENOVAR_COM_ANTECEDENCIA_MS:
-            log.info("Renovando canal do Drive (expira em %sms).", restante)
-            try:
-                drive_client.stop_watch(app_state.channel)
-            except Exception:
-                log.exception("Falha ao parar canal antigo (seguindo mesmo assim).")
-            if app_state.page_token:
-                app_state.channel = drive_client.start_watch(app_state.page_token)
+        restante = estado.channel.expiration_ms - int(time.time() * 1000)
+        if restante >= RENOVAR_COM_ANTECEDENCIA_MS:
+            continue
+        log.info("Renovando canal do Drive (expira em %d ms)", restante)
+        try:
+            await asyncio.to_thread(drive.stop_watch, estado.channel)
+        except Exception:
+            log.exception("Falha ao encerrar o canal antigo (seguindo mesmo assim)")
+        try:
+            estado.channel = await asyncio.to_thread(drive.start_watch, estado.page_token)
+        except Exception as e:
+            log.exception("Falha ao renovar o canal")
+            notifier.notificar_erro("renovação do canal", str(e))
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    problemas = settings.validar()
+    if problemas:
+        log.error("Configuração incompleta: %s", ", ".join(problemas))
+        notifier.notificar_erro_configuracao(problemas)
+        yield
+        return
+
+    tarefa = None
+    try:
+        # O page_token é pego ANTES da varredura inicial para não perder nada
+        # que chegue enquanto ela roda.
+        estado.page_token = await asyncio.to_thread(drive.get_start_page_token)
+        estado.channel = await asyncio.to_thread(drive.start_watch, estado.page_token)
+        tarefa = asyncio.create_task(_renovar_canal_periodicamente())
+        # Recupera o que tenha chegado com o serviço fora do ar.
+        asyncio.create_task(_disparar_varredura(completa=True))
+        log.info(
+            "Organizador no ar — canal registrado, DRY_RUN=%s", settings.dry_run
+        )
+    except Exception as e:
+        log.exception("Falha ao registrar o canal do Drive")
+        notifier.notificar_erro("registro do canal do Drive", str(e))
+
+    yield
+
+    if tarefa:
+        tarefa.cancel()
+    if estado.channel:
+        try:
+            await asyncio.to_thread(drive.stop_watch, estado.channel)
+        except Exception:
+            log.warning("Não consegui encerrar o canal no shutdown")
+
+
+app = FastAPI(title="personal-file-organizer", lifespan=lifespan)
 
 
 # ============================================================================
@@ -235,11 +358,14 @@ async def _renovar_canal_periodicamente() -> None:
 
 @app.get("/")
 def health() -> dict:
-    """Endpoint de health check."""
     return {
         "status": "ok",
-        "canal_ativo": app_state.channel is not None,
+        "canal_ativo": estado.channel is not None,
         "dry_run": settings.dry_run,
+        "varreduras": estado.varreduras,
+        "renomeados": estado.renomeados,
+        "arquivos_em_cache": len(get_state_manager().registros),
+        "ultimo_erro": estado.ultimo_erro,
     }
 
 
@@ -249,82 +375,36 @@ async def drive_webhook(
     x_goog_resource_state: str = Header(default=""),
     x_goog_channel_token: str = Header(default=""),
 ) -> Response:
-    """Webhook do Google Drive — recebe notificações de mudanças."""
     if settings.webhook_token and x_goog_channel_token != settings.webhook_token:
         raise HTTPException(status_code=403, detail="token inválido")
 
+    # Ping de verificação do canal — nada a processar.
     if x_goog_resource_state == "sync":
-        # Ping de verificação inicial — nada a processar
         return Response(status_code=200)
 
-    # Processa mudanças em background
-    background_tasks.add_task(_processar_mudancas)
+    if estado.page_token is None:
+        log.warning("Webhook recebido antes do page_token inicial — ignorando")
+        return Response(status_code=503)
+
+    background_tasks.add_task(_disparar_varredura)
     return Response(status_code=202)
 
 
-async def _processar_mudancas() -> None:
-    """Processa mudanças detectadas pelo webhook."""
-    if app_state.page_token is None:
-        log.warning("Webhook chegou sem page_token inicial — ignorando.")
-        return
+@app.post("/varrer")
+async def varrer_manualmente(
+    background_tasks: BackgroundTasks,
+    completa: bool = True,
+    x_token: str = Header(default=""),
+) -> dict:
+    """Dispara uma varredura na mão (útil depois de trocar o DRY_RUN).
 
-    try:
-        folder_ids = [
-            app_state.pastas_monitoradas[i] for i in range(1, 5)
-            if app_state.pastas_monitoradas[i]
-        ]
-        novos, proximo_token = await asyncio.to_thread(
-            drive_client.list_new_files_since_token, app_state.page_token, folder_ids
-        )
-        app_state.page_token = proximo_token
+    Protegido pelo mesmo WEBHOOK_TOKEN:
+        curl -X POST https://SEU-HOST/varrer -H "x-token: SEU_TOKEN"
+    """
+    if not settings.webhook_token or x_token != settings.webhook_token:
+        raise HTTPException(status_code=403, detail="token inválido")
+    if estado.page_token is None:
+        raise HTTPException(status_code=503, detail="serviço ainda não inicializou")
 
-        if not novos:
-            log.debug("Webhook recebido, nenhum PDF novo nas pastas monitoradas.")
-            return
-
-        log.info("Encontrados %d arquivos novos", len(novos))
-        total_processados = 0
-        total_renomeados = 0
-
-        for arquivo in novos:
-            file_id = arquivo["id"]
-            file_name = arquivo["name"]
-            folder_id = arquivo["folder_id"]
-
-            # GLOBAL LOCK: pular se já está sendo processado por outra task
-            if file_id in app_state.processando_ids:
-                log.debug("Arquivo %s já está sendo processado (paralelo), pulando", file_name)
-                continue
-
-            # Marcar como sendo processado
-            app_state.processando_ids.add(file_id)
-            try:
-                # Determinar pasta número (1-4)
-                folder_num = None
-                for num, fid in app_state.pastas_monitoradas.items():
-                    if fid == folder_id:
-                        folder_num = num
-                        break
-
-                if folder_num is None:
-                    log.warning("Pasta desconhecida: %s", folder_id)
-                    continue
-
-                total_processados += 1
-                if processar_arquivo(file_id, file_name, folder_num):
-                    total_renomeados += 1
-            finally:
-                # Sempre remove do lock
-                app_state.processando_ids.discard(file_id)
-
-        # Notificar APENAS se renomeou algo com SUCESSO (não falhas com ??)
-        # E APENAS se foi de verdade (estado_mgr marcou como sucesso, não notificado)
-        if total_renomeados > 0:
-            log.info("Notificando sucesso: %d renomeados de %d", total_renomeados, total_processados)
-            await asyncio.to_thread(
-                notificar_sucesso_ciclo, total_processados, total_renomeados
-            )
-
-    except Exception:
-        log.exception("Erro ao processar mudanças")
-        await asyncio.to_thread(notificar_erro_autenticacao)
+    background_tasks.add_task(_disparar_varredura, completa)
+    return {"agendado": True, "completa": completa}

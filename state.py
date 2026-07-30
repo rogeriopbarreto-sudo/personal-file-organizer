@@ -1,164 +1,139 @@
-"""Cache persistente de arquivos já processados, notificados ou ignorados.
+"""Cache persistente dos arquivos já processados, notificados ou ignorados.
 
-Evita re-notificar o mesmo arquivo toda vez que o loop roda.
-Usa JSON em volume persistente (Coolify).
+Evita reprocessar e re-notificar o mesmo arquivo a cada webhook.
+Guardado em JSON num volume persistente (Coolify).
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
 log = logging.getLogger("file_organizer.state")
 
-# Diretório de estado (será montado como volume no Coolify)
 STATE_DIR = Path(os.environ.get("STATE_DIR", "/app/state"))
 STATE_FILE = STATE_DIR / "state.json"
 
+# Status possíveis
+SUCESSO = "sucesso"
+INCOMPLETO = "incompleto"  # renomeado, mas com campos "??"
+SEM_DADOS = "sem_dados"
+PROTEGIDO = "protegido"
+ERRO = "erro"
+
 
 @dataclass
-class ArchivoState:
+class RegistroArquivo:
     """Registro de um arquivo já visto."""
 
     file_id: str
     file_name: str
-    folder_num: int  # 1, 2, 3 ou 4
-    status: str  # "success", "notificado", "ignorado", "protegido", "duplicata"
-    data_processamento: str  # ISO 8601
-    motivo: str = ""  # Se status != "success", motivo da notificação
+    folder_num: int
+    status: str
+    data_processamento: str
+    motivo: str = ""
+    nome_novo: str = ""
+    # Processado apenas em simulação: quando o DRY_RUN for desligado, o arquivo
+    # precisa ser processado de verdade.
+    dry_run: bool = False
 
 
 class StateManager:
-    """Gerencia cache persistente."""
+    """Cache persistente em JSON."""
 
-    def __init__(self):
-        self.files: dict[str, ArchivoState] = {}
-        self._load()
+    def __init__(self) -> None:
+        self.registros: dict[str, RegistroArquivo] = {}
+        self._carregar()
 
-    def _ensure_dir(self) -> None:
-        """Cria diretório de estado se não existir."""
+    # -- persistência ----------------------------------------------------
+
+    def _carregar(self) -> None:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
-
-    def _load(self) -> None:
-        """Carrega estado do arquivo JSON."""
-        self._ensure_dir()
-        if STATE_FILE.exists():
-            try:
-                with open(STATE_FILE, "r") as f:
-                    data = json.load(f)
-                    self.files = {
-                        file_id: ArchivoState(**item)
-                        for file_id, item in data.get("files", {}).items()
-                    }
-                log.info("Estado carregado: %d arquivos em cache", len(self.files))
-            except Exception as e:
-                log.error("Erro ao carregar state.json: %s", e)
-                self.files = {}
-        else:
-            log.info("Primeiro run: state.json não existe ainda")
-            self.files = {}
-
-    def _save(self) -> None:
-        """Salva estado no arquivo JSON."""
-        self._ensure_dir()
+        if not STATE_FILE.exists():
+            log.info("Primeiro run: state.json ainda não existe")
+            return
         try:
-            data = {
-                "files": {
-                    file_id: asdict(state)
-                    for file_id, state in self.files.items()
-                }
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                dados = json.load(f)
+            conhecidos = RegistroArquivo.__dataclass_fields__.keys()
+            self.registros = {
+                file_id: RegistroArquivo(
+                    **{k: v for k, v in item.items() if k in conhecidos}
+                )
+                for file_id, item in dados.get("files", {}).items()
             }
-            with open(STATE_FILE, "w") as f:
-                json.dump(data, f, indent=2)
-            log.debug("State salvo")
-        except Exception as e:
-            log.error("Erro ao salvar state.json: %s", e)
+            log.info("Estado carregado: %d arquivos em cache", len(self.registros))
+        except Exception:
+            log.exception("Erro ao carregar state.json — começando vazio")
+            self.registros = {}
 
-    def registrar_sucesso(self, file_id: str, file_name: str, folder_num: int) -> None:
-        """Marca arquivo como processado com sucesso (renomeado)."""
-        self.files[file_id] = ArchivoState(
-            file_id=file_id,
-            file_name=file_name,
-            folder_num=folder_num,
-            status="success",
-            data_processamento=datetime.now(timezone.utc).isoformat(),
-            motivo="",
-        )
-        self._save()
+    def _salvar(self) -> None:
+        """Grava de forma atômica (tmp + replace) para não corromper em queda."""
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        temporario = STATE_FILE.with_suffix(".json.tmp")
+        try:
+            with open(temporario, "w", encoding="utf-8") as f:
+                json.dump(
+                    {"files": {k: asdict(v) for k, v in self.registros.items()}},
+                    f,
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            os.replace(temporario, STATE_FILE)
+        except Exception:
+            log.exception("Erro ao salvar state.json")
 
-    def registrar_notificado(
+    # -- API -------------------------------------------------------------
+
+    def registrar(
         self,
         file_id: str,
         file_name: str,
         folder_num: int,
-        motivo: str,
+        status: str,
+        motivo: str = "",
+        nome_novo: str = "",
+        dry_run: bool = False,
     ) -> None:
-        """Marca arquivo como notificado (não processado, mas já avisado)."""
-        self.files[file_id] = ArchivoState(
+        self.registros[file_id] = RegistroArquivo(
             file_id=file_id,
             file_name=file_name,
             folder_num=folder_num,
-            status="notificado",
+            status=status,
             data_processamento=datetime.now(timezone.utc).isoformat(),
             motivo=motivo,
+            nome_novo=nome_novo,
+            dry_run=dry_run,
         )
-        self._save()
+        self._salvar()
 
-    def registrar_protegido(self, file_id: str, file_name: str, folder_num: int) -> None:
-        """Marca arquivo como protegido por senha."""
-        self.files[file_id] = ArchivoState(
-            file_id=file_id,
-            file_name=file_name,
-            folder_num=folder_num,
-            status="protegido",
-            data_processamento=datetime.now(timezone.utc).isoformat(),
-            motivo="PDF protegido por senha",
-        )
-        self._save()
+    def precisa_processar(self, file_id: str, dry_run_atual: bool) -> bool:
+        """Diz se o arquivo ainda precisa ser processado.
 
-    def registrar_duplicata(
-        self,
-        file_id: str,
-        file_name: str,
-        folder_num: int,
-        nome_existente: str,
-    ) -> None:
-        """Marca arquivo como duplicata suspeita."""
-        self.files[file_id] = ArchivoState(
-            file_id=file_id,
-            file_name=file_name,
-            folder_num=folder_num,
-            status="duplicata",
-            data_processamento=datetime.now(timezone.utc).isoformat(),
-            motivo=f"Possível duplicata de {nome_existente}",
-        )
-        self._save()
+        Um registro feito em modo simulação não conta como processado quando o
+        serviço passa a rodar de verdade — senão nada seria renomeado ao sair
+        do DRY_RUN.
+        """
+        registro = self.registros.get(file_id)
+        if registro is None:
+            return True
+        if registro.dry_run and not dry_run_atual:
+            return True
+        return False
 
-    def ja_visto(self, file_id: str) -> bool:
-        """Retorna True se arquivo já foi processado (em qualquer status)."""
-        return file_id in self.files
-
-    def ja_notificado(self, file_id: str) -> bool:
-        """Retorna True se arquivo já foi notificado (não vai notificar de novo)."""
-        if file_id not in self.files:
-            return False
-        return self.files[file_id].status == "notificado"
-
-    def get(self, file_id: str) -> ArchivoState | None:
-        """Retorna registro do arquivo, ou None se não existe."""
-        return self.files.get(file_id)
+    def get(self, file_id: str) -> RegistroArquivo | None:
+        return self.registros.get(file_id)
 
 
-# Singleton global
-state_manager: StateManager | None = None
+_gerenciador: StateManager | None = None
 
 
 def get_state_manager() -> StateManager:
-    """Retorna a instância global do StateManager."""
-    global state_manager
-    if state_manager is None:
-        state_manager = StateManager()
-    return state_manager
+    """Instância global do StateManager."""
+    global _gerenciador
+    if _gerenciador is None:
+        _gerenciador = StateManager()
+    return _gerenciador

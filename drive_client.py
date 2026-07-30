@@ -1,14 +1,15 @@
-"""Acesso ao Google Drive via service account: webhook + listagem/download/rename de PDFs.
+"""Acesso ao Google Drive via service account: webhook, listagem, download e rename.
 
 Padrão reaproveitado de `03_Passagens Aereas/watcher/app/drive.py`.
-A pasta monitorada precisa estar compartilhada como **Editor** com o e-mail do
-service account — o rename exige permissão de escrita.
+As pastas monitoradas precisam estar compartilhadas como **Editor** com o e-mail
+do service account — o rename exige permissão de escrita.
 """
 from __future__ import annotations
 
 import io
 import json
 import logging
+import re
 import uuid
 from dataclasses import dataclass
 
@@ -22,17 +23,25 @@ log = logging.getLogger("file_organizer.drive")
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 
+MIME_PASTA = "application/vnd.google-apps.folder"
+MIME_PDF = "application/pdf"
+
 
 def _service():
-    """Constrói o client de Drive API com credenciais do service account."""
+    """Constrói o client da Drive API com credenciais do service account."""
     info = json.loads(settings.google_service_account_json)
     creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
+def _escapa(valor: str) -> str:
+    """Escapa aspas simples e barras para uso dentro de uma query do Drive."""
+    return valor.replace("\\", "\\\\").replace("'", "\\'")
+
+
 @dataclass
 class Channel:
-    """Representa um canal de notificação de webhook do Google Drive."""
+    """Canal de notificação push do Google Drive."""
 
     id: str
     resource_id: str
@@ -41,28 +50,32 @@ class Channel:
 
 @dataclass
 class DriveFile:
-    """Representa um arquivo no Drive."""
+    """Arquivo no Drive."""
 
     id: str
     name: str
-    mime_type: str
-    created_time: str
+    mime_type: str = ""
+    created_time: str = ""
+
+
+# ============================================================================
+# Webhook (push notifications)
+# ============================================================================
 
 
 def get_start_page_token() -> str:
-    """Obtém o page token inicial para começar a assistir mudanças."""
-    svc = _service()
-    return svc.changes().getStartPageToken().execute()["startPageToken"]
+    """Page token inicial para começar a observar mudanças."""
+    return _service().changes().getStartPageToken().execute()["startPageToken"]
 
 
 def start_watch(page_token: str) -> Channel:
-    """Registra um canal de notificação para mudanças no Drive a partir de page_token."""
+    """Registra um canal de notificação para mudanças no Drive."""
     svc = _service()
     channel_id = str(uuid.uuid4())
     body = {
         "id": channel_id,
         "type": "web_hook",
-        "address": f"{settings.webhook_base_url}/drive-webhook",
+        "address": f"{settings.webhook_base_url.rstrip('/')}/drive-webhook",
         "token": settings.webhook_token,
     }
     resp = svc.changes().watch(pageToken=page_token, body=body).execute()
@@ -75,142 +88,200 @@ def start_watch(page_token: str) -> Channel:
 
 
 def stop_watch(channel: Channel) -> None:
-    """Para um canal de notificação."""
-    svc = _service()
-    svc.channels().stop(body={"id": channel.id, "resourceId": channel.resource_id}).execute()
-    log.info("Canal %s parado", channel.id)
+    """Encerra um canal de notificação."""
+    _service().channels().stop(
+        body={"id": channel.id, "resourceId": channel.resource_id}
+    ).execute()
+    log.info("Canal %s encerrado", channel.id)
 
 
-def list_new_files_since_token(
-    page_token: str, folder_ids: list[str]
-) -> tuple[list[dict], str]:
-    """Lista arquivos novos/alterados nas pastas especificadas desde page_token.
+def listar_mudancas(page_token: str) -> tuple[list[dict], str]:
+    """Lista os PDFs criados/alterados desde `page_token`.
 
-    Retorna (lista de {id, name, folder_id}, novo_page_token).
+    Retorna (lista de {id, name, parents}, próximo page_token). O filtro por
+    pasta é feito por quem chama — aqui só devolvemos os PDFs vivos.
     """
     svc = _service()
     novos: list[dict] = []
     token = page_token
-    log.debug("list_new_files_since_token: procurando em pastas %s", folder_ids)
+
     while token:
         resp = (
             svc.changes()
             .list(
                 pageToken=token,
                 spaces="drive",
-                fields="nextPageToken,newStartPageToken,changes(fileId,removed,file(id,name,parents,mimeType,trashed))",
+                pageSize=200,
+                fields=(
+                    "nextPageToken,newStartPageToken,"
+                    "changes(fileId,removed,file(id,name,parents,mimeType,trashed))"
+                ),
             )
             .execute()
         )
-        changes_encontrados = len(resp.get("changes", []))
-        log.debug("Mudanças detectadas: %d", changes_encontrados)
 
-        for change in resp.get("changes", []):
-            f = change.get("file")
-            if not f:
-                log.debug("Mudança sem arquivo, ignorando")
+        for mudanca in resp.get("changes", []):
+            arquivo = mudanca.get("file")
+            if not arquivo or mudanca.get("removed") or arquivo.get("trashed"):
                 continue
-            if change.get("removed"):
-                log.debug("Arquivo %s foi removido, ignorando", f.get("name"))
+            if arquivo.get("mimeType") != MIME_PDF:
                 continue
-            if f.get("trashed"):
-                log.debug("Arquivo %s está na lixeira, ignorando", f.get("name"))
-                continue
-            if f.get("mimeType") != "application/pdf":
-                log.debug("Arquivo %s não é PDF (tipo: %s), ignorando", f.get("name"), f.get("mimeType"))
-                continue
-
-            # Verificar se está em uma das pastas monitoradas
-            file_parents = f.get("parents") or []
-            log.debug("Arquivo %s está em pastas: %s", f.get("name"), file_parents)
-
-            encontrado = False
-            for folder_id in folder_ids:
-                if folder_id in file_parents:
-                    log.info("Arquivo encontrado: %s (pasta %s)", f.get("name"), folder_id)
-                    novos.append({"id": f["id"], "name": f["name"], "folder_id": folder_id})
-                    encontrado = True
-                    break
-
-            if not encontrado:
-                log.debug("Arquivo %s não está em nenhuma pasta monitorada", f.get("name"))
+            novos.append(
+                {
+                    "id": arquivo["id"],
+                    "name": arquivo["name"],
+                    "parents": arquivo.get("parents") or [],
+                }
+            )
 
         if "nextPageToken" in resp:
             token = resp["nextPageToken"]
         else:
             return novos, resp["newStartPageToken"]
+
     return novos, page_token
 
 
-def list_files_in_folder(folder_id: str) -> list[DriveFile]:
-    """Lista todos os arquivos PDF (não deletados, não na lixeira) dentro de uma pasta.
+# ============================================================================
+# Listagem
+# ============================================================================
 
-    Retorna lista de DriveFile ordenada por created_time (mais antigos primeiro).
-    """
+
+def listar_subpastas(folder_id: str) -> list[DriveFile]:
+    """Subpastas diretas de uma pasta (usado para descobrir os bancos da Pasta 04)."""
     if not folder_id:
-        log.warning("folder_id vazio, pulando listagem")
+        return []
+    try:
+        resp = (
+            _service()
+            .files()
+            .list(
+                q=f"'{_escapa(folder_id)}' in parents and trashed=false "
+                f"and mimeType='{MIME_PASTA}'",
+                spaces="drive",
+                fields="files(id,name)",
+                pageSize=100,
+            )
+            .execute()
+        )
+    except Exception:
+        log.exception("Falha ao listar subpastas de %s", folder_id)
+        return []
+    return [DriveFile(id=f["id"], name=f["name"]) for f in resp.get("files", [])]
+
+
+def listar_pdfs(folder_id: str) -> list[DriveFile]:
+    """Todos os PDFs de uma pasta, mais antigos primeiro."""
+    if not folder_id:
         return []
 
     svc = _service()
-    files = []
+    arquivos: list[DriveFile] = []
     page_token = None
-
     try:
         while True:
             resp = (
                 svc.files()
                 .list(
-                    q=f"'{folder_id}' in parents and trashed=false",
+                    q=f"'{_escapa(folder_id)}' in parents and trashed=false "
+                    f"and mimeType='{MIME_PDF}'",
                     spaces="drive",
                     fields="nextPageToken,files(id,name,mimeType,createdTime)",
-                    pageSize=100,
+                    pageSize=200,
                     pageToken=page_token,
                 )
                 .execute()
             )
-
             for f in resp.get("files", []):
-                if f.get("mimeType") == "application/pdf":
-                    files.append(
-                        DriveFile(
-                            id=f["id"],
-                            name=f["name"],
-                            mime_type=f["mimeType"],
-                            created_time=f.get("createdTime", ""),
-                        )
+                arquivos.append(
+                    DriveFile(
+                        id=f["id"],
+                        name=f["name"],
+                        mime_type=f.get("mimeType", ""),
+                        created_time=f.get("createdTime", ""),
                     )
-
+                )
             page_token = resp.get("nextPageToken")
             if not page_token:
                 break
-
-    except Exception as e:
-        log.error("Erro ao listar pasta %s: %s", folder_id, e)
+    except Exception:
+        log.exception("Falha ao listar PDFs de %s", folder_id)
         return []
 
-    # Ordenar por created_time (mais antigos primeiro)
-    files.sort(key=lambda x: x.created_time)
-    return files
+    arquivos.sort(key=lambda a: a.created_time)
+    return arquivos
+
+
+def nome_existe(folder_id: str, nome: str, ignorar_id: str | None = None) -> bool:
+    """Diz se já existe um arquivo com esse nome exato na pasta."""
+    try:
+        resp = (
+            _service()
+            .files()
+            .list(
+                q=f"'{_escapa(folder_id)}' in parents and trashed=false "
+                f"and name='{_escapa(nome)}'",
+                spaces="drive",
+                fields="files(id)",
+                pageSize=10,
+            )
+            .execute()
+        )
+    except Exception:
+        log.exception("Falha ao checar existência de '%s'", nome)
+        # Assume que existe: é mais seguro gerar um sufixo do que sobrescrever.
+        return True
+    return any(f["id"] != ignorar_id for f in resp.get("files", []))
+
+
+def nome_sem_colisao(
+    folder_id: str, nome_desejado: str, ignorar_id: str | None = None, limite: int = 50
+) -> str:
+    """Devolve o nome desejado ou, se já existir, com sufixo ' (2)', ' (3)'...
+
+    Nunca sobrescreve um arquivo existente — regra inegociável do projeto.
+    """
+    if not nome_existe(folder_id, nome_desejado, ignorar_id):
+        return nome_desejado
+
+    base, _, extensao = nome_desejado.rpartition(".")
+    if not base:  # nome sem extensão
+        base, extensao = nome_desejado, ""
+    sufixo_ext = f".{extensao}" if extensao else ""
+
+    # Se o nome já vier com "(N)", começa a contagem a partir dele.
+    m = re.match(r"^(.*) \((\d+)\)$", base)
+    if m:
+        base, inicio = m.group(1), int(m.group(2)) + 1
+    else:
+        inicio = 2
+
+    for n in range(inicio, inicio + limite):
+        candidato = f"{base} ({n}){sufixo_ext}"
+        if not nome_existe(folder_id, candidato, ignorar_id):
+            log.info("Nome '%s' já existe — usando '%s'", nome_desejado, candidato)
+            return candidato
+
+    raise RuntimeError(f"Não achei nome livre para '{nome_desejado}' após {limite} tentativas")
+
+
+# ============================================================================
+# Download e rename
+# ============================================================================
 
 
 def download_pdf(file_id: str) -> bytes:
-    """Baixa conteúdo do PDF em bytes."""
-    svc = _service()
-    request = svc.files().get_media(fileId=file_id)
-    buf = io.BytesIO()
-    downloader = MediaIoBaseDownload(buf, request)
-    done = False
-    while not done:
-        _, done = downloader.next_chunk()
-    return buf.getvalue()
+    """Baixa o conteúdo do PDF."""
+    request = _service().files().get_media(fileId=file_id)
+    buffer = io.BytesIO()
+    downloader = MediaIoBaseDownload(buffer, request)
+    concluido = False
+    while not concluido:
+        _, concluido = downloader.next_chunk()
+    return buffer.getvalue()
 
 
 def rename_file(file_id: str, novo_nome: str) -> None:
     """Renomeia o arquivo no Drive."""
-    svc = _service()
-    try:
-        svc.files().update(fileId=file_id, body={"name": novo_nome}).execute()
-        log.info("Arquivo %s renomeado para %s", file_id, novo_nome)
-    except Exception as e:
-        log.error("Erro ao renomear arquivo %s: %s", file_id, e)
-        raise
+    _service().files().update(fileId=file_id, body={"name": novo_nome}).execute()
+    log.info("Arquivo %s renomeado para %s", file_id, novo_nome)
