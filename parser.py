@@ -76,87 +76,47 @@ class NotaBTG:
 
 
 def parse_pasta_01_btg_notas(pdf_bytes: bytes) -> NotaBTG:
-    """Extrai campos de Nota de Corretagem BTG."""
+    """Extrai campos de Nota de Corretagem BTG — padrão MM-DD - Ativo - TipoOp - R$Valor."""
     texto = extrair_texto_pdf(pdf_bytes)
     if not texto:
         return NotaBTG(None, None, None, None)
 
     nota = NotaBTG(None, None, None, None)
     linhas = texto.split("\n")
+    texto_lower = texto.lower()
 
-    # 1. Data da Operação: procurar padrão DD/MM/YYYY após "Data da Operação"
-    for i, linha in enumerate(linhas):
-        if "data da operação" in linha.lower():
-            match = re.search(r"(\d{2})/(\d{2})/(\d{4})", linha)
-            if match:
-                # Extrai MM-DD
-                nota.data = f"{match.group(2)}-{match.group(1)}"
-                break
+    # 1. Data: DD/MM/YYYY → MM-DD
+    match = re.search(r"data da operação\s+(\d{2})/(\d{2})/(\d{4})", texto_lower, re.IGNORECASE)
+    if match:
+        nota.data = f"{match.group(2)}-{match.group(1)}"
 
-    # 2. Tipo de Operação: procurar "Compra", "Venda" ou "Juros" (case-insensitive, word boundary)
-    for linha in linhas:
-        match = re.search(r"\b(Compra|Venda|Juros)\b", linha, re.IGNORECASE)
-        if match:
-            nota.tipo_op = match.group(1).capitalize()
+    # 2. Tipo: Compra, Venda ou Juros
+    for tipo in ["Venda", "Compra", "Juros"]:
+        if re.search(r"\b" + tipo + r"\b", texto, re.IGNORECASE):
+            nota.tipo_op = tipo
             break
 
-    # 3. Ativo: procurar na tabela "Características dos Títulos"
-    # Estratégia: achar linha com "Título", depois linha com "Emitente", e extrair o código entre elas
-    for i, linha in enumerate(linhas):
-        if "título" in linha.lower() and "emitente" in linhas[i+1].lower() if i+1 < len(linhas) else False:
-            # Próxima linha após "Emitente" deve ter o código ou a linha de dados
-            if i + 2 < len(linhas):
-                linha_dados = linhas[i + 2].strip()
-                # Procura padrão DEB - ENEVB0 ou similar (código após hífen ou isolado)
-                match = re.search(r"([A-Z][A-Z0-9-]{2,})", linha_dados)
-                if match and match.group(1) not in ("DEB", "CDA", "NTN", "LCI"):
-                    # Se achou mas é um prefixo, tenta pegar o próximo
-                    full_match = re.search(r"([A-Z][A-Z0-9-]{2,})\s*(?:-|$)", linha_dados)
-                    if full_match:
-                        nota.ativo = full_match.group(1)
-                        break
-                # Fallback: pegar qualquer código depois do prefixo
-                match = re.search(r"(?:DEB|CDA|NTN|LCI)\s*-\s*([A-Z][A-Z0-9]{2,})", linha_dados)
-                if match:
-                    nota.ativo = match.group(1)
-                    break
+    # 3. Ativo: código na tabela "Características dos Títulos"
+    # Padrão exato: após linha "Título" vem a linha com "DEB - ENEVB0" ou similar
+    # Procura por padrão: (palavra) - (CÓDIGO)
+    match = re.search(
+        r"(?:DEB|CDA|NTN|LCI|LETRA|NOTA)\s*-\s*([A-Z][A-Z0-9]{2,})",
+        texto,
+        re.IGNORECASE
+    )
+    if match:
+        nota.ativo = match.group(1)
 
-    # Fallback: procurar código de ativo na estrutura simples (linha com só código)
-    if not nota.ativo:
-        for linha in linhas:
-            linha_clean = linha.strip()
-            # Padrão: 4-10 caracteres, maiúsculas/dígitos/hífen, não é palavra genérica
-            if re.match(r"^[A-Z][A-Z0-9-]{2,}$", linha_clean):
-                if linha_clean not in ("IMPORTANTE", "OBSERVAÇÕES", "CARACTERÍSTICAS", "OPERAÇÕES", "VENCIMENTO", "EMITENTE"):
-                    nota.ativo = linha_clean
-                    break
-
-    # 4. Valor Líquido: procurar linha com "Valor Líquido" e extrair número após ela
-    for i, linha in enumerate(linhas):
-        if "valor líquido" in linha.lower():
-            # Tenta extrair número da mesma linha
-            match = re.search(r"([\d.]+,\d{2})", linha)
-            if match:
-                nota.valor = f"R${match.group(1)}"
-                break
-            # Se não está na mesma linha, tenta próxima
-            if i + 1 < len(linhas):
-                match = re.search(r"([\d.]+,\d{2})", linhas[i + 1])
-                if match:
-                    nota.valor = f"R${match.group(1)}"
-                    break
-
-    # Fallback: procurar valor líquido em formato "X.XXX,XX" com valor > 10 (evita valores pequenos tipo taxas)
-    if not nota.valor:
-        for linha in linhas:
-            matches = re.findall(r"([\d.]+,\d{2})", linha)
-            for match_val in matches:
-                val_float = float(match_val.replace(".", "").replace(",", "."))
-                if val_float > 10:  # Valor mínimo pra ser valor líquido
-                    nota.valor = f"R${match_val}"
-                    break
-            if nota.valor:
-                break
+    # 4. Valor Líquido: procura "Valor Líquido" seguido de número (mesmo formato: X.XXX,XX)
+    # Estratégia: procurar a célula "Valor Líquido" e pegar o número na mesma linha ou próxima
+    # Padrão: Valor Líquido seguido de espaços e número com ponto como milhar
+    match = re.search(
+        r"valor\s+líquido\s+([\d.]+,\d{2})",
+        texto,
+        re.IGNORECASE
+    )
+    if match:
+        nota.valor = f"R${match.group(1)}"
 
     return nota
 
