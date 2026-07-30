@@ -79,22 +79,31 @@ def parse_pasta_01_btg_notas(pdf_bytes: bytes) -> NotaBTG:
     """Extrai campos de Nota de Corretagem BTG — padrão MM-DD - Ativo - TipoOp - R$Valor."""
     texto = extrair_texto_pdf(pdf_bytes)
     if not texto:
+        log.warning("Texto vazio do PDF")
         return NotaBTG(None, None, None, None)
 
     nota = NotaBTG(None, None, None, None)
     linhas = texto.split("\n")
     texto_lower = texto.lower()
 
+    log.debug("Iniciando parse Pasta 01, tamanho texto: %d chars", len(texto))
+
     # 1. Data: DD/MM/YYYY → MM-DD
     match = re.search(r"data da operação\s+(\d{2})/(\d{2})/(\d{4})", texto_lower, re.IGNORECASE)
     if match:
         nota.data = f"{match.group(2)}-{match.group(1)}"
+        log.debug("Data extraída: %s", nota.data)
+    else:
+        log.debug("Data NÃO extraída")
 
     # 2. Tipo: Compra, Venda ou Juros
     for tipo in ["Venda", "Compra", "Juros"]:
         if re.search(r"\b" + tipo + r"\b", texto, re.IGNORECASE):
             nota.tipo_op = tipo
+            log.debug("Tipo extraído: %s", nota.tipo_op)
             break
+    if not nota.tipo_op:
+        log.debug("Tipo NÃO extraído")
 
     # 3. Ativo: código na tabela "Características dos Títulos"
     # Padrão exato: após linha "Título" vem a linha com "DEB - ENEVB0" ou similar
@@ -106,6 +115,13 @@ def parse_pasta_01_btg_notas(pdf_bytes: bytes) -> NotaBTG:
     )
     if match:
         nota.ativo = match.group(1)
+        log.debug("Ativo extraído: %s", nota.ativo)
+    else:
+        log.debug("Ativo NÃO extraído (procurou por padrão DEB/CDA/NTN/LCI/etc)")
+        # Log primeira linha com "Características" pra debugar
+        for i, linha in enumerate(linhas[:50]):
+            if "características" in linha.lower() or "título" in linha.lower():
+                log.debug("  Linha %d: %s", i, linha[:100])
 
     # 4. Valor Líquido: procura "Valor Líquido" seguido de número (mesmo formato: X.XXX,XX)
     # Estratégia: procurar a célula "Valor Líquido" e pegar o número na mesma linha ou próxima
@@ -117,6 +133,12 @@ def parse_pasta_01_btg_notas(pdf_bytes: bytes) -> NotaBTG:
     )
     if match:
         nota.valor = f"R${match.group(1)}"
+        log.debug("Valor extraído: %s", nota.valor)
+    else:
+        log.debug("Valor NÃO extraído (procurou por 'Valor Líquido')")
+
+    log.info("Parse Pasta 01 resultado: data=%s, tipo=%s, ativo=%s, valor=%s",
+             nota.data, nota.tipo_op, nota.ativo, nota.valor)
 
     return nota
 

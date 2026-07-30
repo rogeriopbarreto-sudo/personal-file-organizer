@@ -76,6 +76,8 @@ class AppState:
             "BTG": parse_pasta_04_banking_btg,
             "Itau": parse_pasta_04_banking_itau,
         }
+        # Global lock pra evitar processamento paralelo do mesmo arquivo
+        self.processando_ids: set[str] = set()
 
 
 app_state = AppState()
@@ -284,36 +286,39 @@ async def _processar_mudancas() -> None:
         total_processados = 0
         total_renomeados = 0
 
-        # Deduplica arquivos no mesmo ciclo (webhook pode chamar várias vezes)
-        processados_neste_ciclo = set()
-
         for arquivo in novos:
             file_id = arquivo["id"]
             file_name = arquivo["name"]
             folder_id = arquivo["folder_id"]
 
-            # Pular se já processado neste ciclo
-            if file_id in processados_neste_ciclo:
-                log.debug("Arquivo %s já processado neste ciclo, pulando", file_name)
-                continue
-            processados_neste_ciclo.add(file_id)
-
-            # Determinar pasta número (1-4)
-            folder_num = None
-            for num, fid in app_state.pastas_monitoradas.items():
-                if fid == folder_id:
-                    folder_num = num
-                    break
-
-            if folder_num is None:
-                log.warning("Pasta desconhecida: %s", folder_id)
+            # GLOBAL LOCK: pular se já está sendo processado por outra task
+            if file_id in app_state.processando_ids:
+                log.debug("Arquivo %s já está sendo processado (paralelo), pulando", file_name)
                 continue
 
-            total_processados += 1
-            if processar_arquivo(file_id, file_name, folder_num):
-                total_renomeados += 1
+            # Marcar como sendo processado
+            app_state.processando_ids.add(file_id)
+            try:
+                # Determinar pasta número (1-4)
+                folder_num = None
+                for num, fid in app_state.pastas_monitoradas.items():
+                    if fid == folder_id:
+                        folder_num = num
+                        break
 
-        # Notificar APENAS se renomeou algo de verdade (não se tudo foi ??  ou erro)
+                if folder_num is None:
+                    log.warning("Pasta desconhecida: %s", folder_id)
+                    continue
+
+                total_processados += 1
+                if processar_arquivo(file_id, file_name, folder_num):
+                    total_renomeados += 1
+            finally:
+                # Sempre remove do lock
+                app_state.processando_ids.discard(file_id)
+
+        # Notificar APENAS se renomeou algo com SUCESSO (não falhas com ??)
+        # E APENAS se foi de verdade (estado_mgr marcou como sucesso, não notificado)
         if total_renomeados > 0:
             log.info("Notificando sucesso: %d renomeados de %d", total_renomeados, total_processados)
             await asyncio.to_thread(
