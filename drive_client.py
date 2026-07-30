@@ -1,4 +1,4 @@
-"""Acesso ao Google Drive via service account: listagem, download e rename de PDFs.
+"""Acesso ao Google Drive via service account: webhook + listagem/download/rename de PDFs.
 
 Padrão reaproveitado de `03_Passagens Aereas/watcher/app/drive.py`.
 A pasta monitorada precisa estar compartilhada como **Editor** com o e-mail do
@@ -9,6 +9,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import uuid
 from dataclasses import dataclass
 
 from google.oauth2 import service_account
@@ -30,6 +31,15 @@ def _service():
 
 
 @dataclass
+class Channel:
+    """Representa um canal de notificação de webhook do Google Drive."""
+
+    id: str
+    resource_id: str
+    expiration_ms: int
+
+
+@dataclass
 class DriveFile:
     """Representa um arquivo no Drive."""
 
@@ -37,6 +47,77 @@ class DriveFile:
     name: str
     mime_type: str
     created_time: str
+
+
+def get_start_page_token() -> str:
+    """Obtém o page token inicial para começar a assistir mudanças."""
+    svc = _service()
+    return svc.changes().getStartPageToken().execute()["startPageToken"]
+
+
+def start_watch(page_token: str) -> Channel:
+    """Registra um canal de notificação para mudanças no Drive a partir de page_token."""
+    svc = _service()
+    channel_id = str(uuid.uuid4())
+    body = {
+        "id": channel_id,
+        "type": "web_hook",
+        "address": f"{settings.webhook_base_url}/drive-webhook",
+        "token": settings.webhook_token,
+    }
+    resp = svc.changes().watch(pageToken=page_token, body=body).execute()
+    log.info("Canal Drive registrado: %s (expira em %s)", channel_id, resp.get("expiration"))
+    return Channel(
+        id=channel_id,
+        resource_id=resp["resourceId"],
+        expiration_ms=int(resp.get("expiration", 0)),
+    )
+
+
+def stop_watch(channel: Channel) -> None:
+    """Para um canal de notificação."""
+    svc = _service()
+    svc.channels().stop(body={"id": channel.id, "resourceId": channel.resource_id}).execute()
+    log.info("Canal %s parado", channel.id)
+
+
+def list_new_files_since_token(
+    page_token: str, folder_ids: list[str]
+) -> tuple[list[dict], str]:
+    """Lista arquivos novos/alterados nas pastas especificadas desde page_token.
+
+    Retorna (lista de {id, name, folder_id}, novo_page_token).
+    """
+    svc = _service()
+    novos: list[dict] = []
+    token = page_token
+    while token:
+        resp = (
+            svc.changes()
+            .list(
+                pageToken=token,
+                spaces="drive",
+                fields="nextPageToken,newStartPageToken,changes(fileId,removed,file(id,name,parents,mimeType,trashed))",
+            )
+            .execute()
+        )
+        for change in resp.get("changes", []):
+            f = change.get("file")
+            if not f or change.get("removed") or f.get("trashed"):
+                continue
+            if f.get("mimeType") != "application/pdf":
+                continue
+            # Verificar se está em uma das pastas monitoradas
+            file_parents = f.get("parents") or []
+            for folder_id in folder_ids:
+                if folder_id in file_parents:
+                    novos.append({"id": f["id"], "name": f["name"], "folder_id": folder_id})
+                    break
+        if "nextPageToken" in resp:
+            token = resp["nextPageToken"]
+        else:
+            return novos, resp["newStartPageToken"]
+    return novos, page_token
 
 
 def list_files_in_folder(folder_id: str) -> list[DriveFile]:

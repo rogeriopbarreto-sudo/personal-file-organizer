@@ -25,7 +25,11 @@ class Settings:
     telegram_bot_token: str = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id: str = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-    # Polling
+    # Webhook (Drive push notifications)
+    webhook_base_url: str = os.environ.get("WEBHOOK_BASE_URL", "http://localhost:8000")
+    webhook_token: str = os.environ.get("WEBHOOK_TOKEN", "")
+
+    # Polling (legacy, mantém compatibilidade)
     poll_interval_seconds: int = int(os.environ.get("POLL_INTERVAL_SECONDS", "300"))
 
     # Modo seco (testa sem fazer rename real)
@@ -43,6 +47,8 @@ class Settings:
             "anthropic_api_key",
             "telegram_bot_token",
             "telegram_chat_id",
+            "webhook_base_url",
+            "webhook_token",
         ):
             if not getattr(self, campo):
                 faltando.append(campo.upper())

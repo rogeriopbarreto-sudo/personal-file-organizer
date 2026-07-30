@@ -1,14 +1,24 @@
-"""Loop principal: polling das 4 pastas, parsing, rename, notificação."""
+"""FastAPI: recebe webhook do Google Drive e processa organização de arquivos.
+
+Fluxo: Drive detecta mudança → chama POST /drive-webhook → listamos as mudanças desde
+o último page_token → processamos PDFs novos (renomear ou notificar) → registramos em state.
+
+Não há agendamento: o único jeito de algo rodar aqui é o Drive avisar (ou o boot, que
+registra o canal de notificação).
+"""
 from __future__ import annotations
 
+import asyncio
 import logging
 import logging.config
 import time
 import traceback
-from pathlib import Path
 
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Response
+
+from . import drive_client
 from .config import settings
-from .drive_client import download_pdf, list_files_in_folder, rename_file
+from .drive_client import Channel, download_pdf, rename_file
 from .notifier import (
     notificar_arquivo_sem_dados,
     notificar_banco_novo,
@@ -36,34 +46,50 @@ logging.basicConfig(
 )
 log = logging.getLogger("file_organizer.main")
 
-
 # ============================================================================
-# Configuração de pastas
+# FastAPI App
 # ============================================================================
 
+app = FastAPI(title="personal-file-organizer")
 
-PASTAS_MONITORADAS = {
-    1: {"id": settings.drive_folder_01, "nome": "01_BTG Notas de Corretagem"},
-    2: {"id": settings.drive_folder_02, "nome": "02_Relatorio de Performance"},
-    3: {"id": settings.drive_folder_03, "nome": "03_Extrato Investimentos"},
-    4: {"id": settings.drive_folder_04, "nome": "04_BTG Extratos Banking"},
-}
-
-BANCOS_CONHECIDOS = {
-    "BTG": parse_pasta_04_banking_btg,
-    "Itau": parse_pasta_04_banking_itau,
-}
+# Renovação de canal 12h antes de expirar
+RENOVAR_COM_ANTECEDENCIA_MS = 12 * 60 * 60 * 1000
 
 
 # ============================================================================
-# Processamento de um arquivo
+# Estado global
+# ============================================================================
+
+class AppState:
+    """Estado compartilhado entre requests."""
+
+    def __init__(self):
+        self.page_token: str | None = None
+        self.channel: Channel | None = None
+        self.pastas_monitoradas = {
+            1: settings.drive_folder_01,
+            2: settings.drive_folder_02,
+            3: settings.drive_folder_03,
+            4: settings.drive_folder_04,
+        }
+        self.bancos_conhecidos = {
+            "BTG": parse_pasta_04_banking_btg,
+            "Itau": parse_pasta_04_banking_itau,
+        }
+
+
+app_state = AppState()
+
+
+# ============================================================================
+# Processamento de arquivo (reutilizado do código antigo)
 # ============================================================================
 
 
 def processar_arquivo(file_id: str, file_name: str, folder_num: int) -> bool:
     """Processa um arquivo: baixa, parseia, renomeia (ou notifica).
 
-    Retorna True se processado com sucesso (renomeado ou já válido), False se erro/ambíguo.
+    Retorna True se processado com sucesso, False se erro/ambíguo.
     """
     state_mgr = get_state_manager()
 
@@ -89,14 +115,11 @@ def processar_arquivo(file_id: str, file_name: str, folder_num: int) -> bool:
 
         # Determinar nome novo
         if folder_num == 4:
-            # Pasta 04: precisa detectar subpasta/banco
             nome_banco = detectar_banco_pasta_04(file_name)
             if not nome_banco:
                 log.warning("Não conseguiu detectar banco para %s", file_name)
                 notificar_banco_novo("Desconhecido", file_name)
-                state_mgr.registrar_notificado(
-                    file_id, file_name, folder_num, "Banco desconhecido"
-                )
+                state_mgr.registrar_notificado(file_id, file_name, folder_num, "Banco desconhecido")
                 return False
         else:
             nome_banco = None
@@ -104,7 +127,6 @@ def processar_arquivo(file_id: str, file_name: str, folder_num: int) -> bool:
         nome_novo = determinar_nome_novo(folder_num, nome_banco, file_name, pdf_bytes)
 
         if not nome_novo:
-            # Parser não conseguiu extrair nenhum campo
             log.warning("Arquivo %s sem dados reconhecidos", file_name)
             notificar_arquivo_sem_dados(file_name, folder_num)
             state_mgr.registrar_notificado(file_id, file_name, folder_num, "Sem dados")
@@ -135,109 +157,148 @@ def processar_arquivo(file_id: str, file_name: str, folder_num: int) -> bool:
 
 
 def detectar_banco_pasta_04(file_name: str) -> str | None:
-    """Detecta banco pela subpasta ou nome do arquivo.
-
-    Heurística simples: procura "BTG" ou "Itau" no nome.
-    TODO: melhorar pra detectar pela subpasta real no Drive.
-    """
-    # Por enquanto, heurística no nome
+    """Detecta banco pela heurística no nome do arquivo."""
     if "itau" in file_name.lower():
         return "Itau"
     elif "btg" in file_name.lower() or "banco" in file_name.lower():
         return "BTG"
     else:
-        return None  # Banco desconhecido
+        return None
 
 
 def verificar_duplicata_pasta_03(file_id: str, file_name: str, nome_novo: str) -> str | None:
-    """Verifica se arquivo é uma possível duplicata (Pasta 03 apenas).
-
-    Retorna:
-    - "ok": prosseguir com rename
-    - "duplicata": suspeitade duplicata, não renomear
-    - "mesmo_arquivo": arquivo idêntico ao existente
-    """
-    # TODO: implementar lógica de comparar tamanho/hash com arquivo existente
-    # Por enquanto, apenas retornar "ok" (será melhorado depois)
+    """Verifica se arquivo é uma possível duplicata (Pasta 03 apenas)."""
+    # TODO: implementar lógica de comparar tamanho/hash
     return "ok"
 
 
 # ============================================================================
-# Ciclo principal
+# Lifecycle
 # ============================================================================
 
 
-def rodar_ciclo() -> None:
-    """Executa um ciclo de polling: lista arquivos das 4 pastas, processa cada um."""
-    state_mgr = get_state_manager()
-    total_processados = 0
-    total_renomeados = 0
-
-    log.info("=== INICIANDO CICLO ===")
-
-    # Validar configuração
+@app.on_event("startup")
+async def startup() -> None:
+    """Ao iniciar, registra o canal de notificação e pega o page_token inicial."""
     faltando = settings.validar()
     if faltando:
-        log.error("Configuração incompleta: faltam %s", ", ".join(faltando))
-        notificar_erro_autenticacao()
+        log.error("Variáveis de ambiente faltando: %s — organizador não vai registrar o canal.", faltando)
         return
 
-    for folder_num, folder_info in PASTAS_MONITORADAS.items():
-        folder_id = folder_info["id"]
-        folder_nome = folder_info["nome"]
-
-        if not folder_id:
-            log.warning("Pasta %d não configurada (ID vazio)", folder_num)
-            continue
-
-        log.info("Listando arquivos da pasta %d (%s)", folder_num, folder_nome)
-
-        try:
-            arquivos = list_files_in_folder(folder_id)
-            log.info("  Encontrados %d PDFs", len(arquivos))
-
-            for arquivo in arquivos:
-                total_processados += 1
-
-                if processar_arquivo(arquivo.id, arquivo.name, folder_num):
-                    total_renomeados += 1
-
-        except Exception as e:
-            log.error("Erro ao listar pasta %d: %s", folder_num, traceback.format_exc())
-            notificar_erro_autenticacao()
-
-    log.info("=== CICLO CONCLUÍDO ===")
-    log.info("Total: %d processados, %d renomeados", total_processados, total_renomeados)
-
-    # Notificar sucesso se houver algo para notificar
-    if total_renomeados > 0:
-        notificar_sucesso_ciclo(total_processados, total_renomeados)
+    try:
+        app_state.page_token = drive_client.get_start_page_token()
+        folder_ids = [
+            app_state.pastas_monitoradas[i] for i in range(1, 5)
+            if app_state.pastas_monitoradas[i]
+        ]
+        app_state.channel = drive_client.start_watch(app_state.page_token)
+        asyncio.create_task(_renovar_canal_periodicamente())
+        log.info("Organizador iniciado — canal de notificações registrado")
+    except Exception as e:
+        log.error("Falha ao iniciar: %s", traceback.format_exc())
+        notificar_erro_autenticacao()
 
 
-def loop_principal() -> None:
-    """Loop infinito: polling a cada poll_interval_seconds."""
-    log.info("Iniciando loop principal")
-    log.info("Intervalo de polling: %d segundos", settings.poll_interval_seconds)
-    log.info("DRY_RUN: %s", settings.dry_run)
-
-    ciclo_count = 0
+async def _renovar_canal_periodicamente() -> None:
+    """Renova o canal de notificação a cada hora, se necessário."""
     while True:
-        try:
-            ciclo_count += 1
-            log.info("--- Ciclo #%d ---", ciclo_count)
-            rodar_ciclo()
-
-        except KeyboardInterrupt:
-            log.info("Interrompido pelo usuário")
-            break
-
-        except Exception as e:
-            log.error("Erro não tratado: %s", traceback.format_exc())
-
-        log.info("Dormindo %d segundos...", settings.poll_interval_seconds)
-        time.sleep(settings.poll_interval_seconds)
+        await asyncio.sleep(60 * 60)  # confere de hora em hora
+        if not app_state.channel:
+            continue
+        restante = app_state.channel.expiration_ms - int(time.time() * 1000)
+        if restante < RENOVAR_COM_ANTECEDENCIA_MS:
+            log.info("Renovando canal do Drive (expira em %sms).", restante)
+            try:
+                drive_client.stop_watch(app_state.channel)
+            except Exception:
+                log.exception("Falha ao parar canal antigo (seguindo mesmo assim).")
+            if app_state.page_token:
+                app_state.channel = drive_client.start_watch(app_state.page_token)
 
 
-if __name__ == "__main__":
-    log.info("Starting Personal File Organizer")
-    loop_principal()
+# ============================================================================
+# Endpoints
+# ============================================================================
+
+
+@app.get("/")
+def health() -> dict:
+    """Endpoint de health check."""
+    return {
+        "status": "ok",
+        "canal_ativo": app_state.channel is not None,
+        "dry_run": settings.dry_run,
+    }
+
+
+@app.post("/drive-webhook")
+async def drive_webhook(
+    background_tasks: BackgroundTasks,
+    x_goog_resource_state: str = Header(default=""),
+    x_goog_channel_token: str = Header(default=""),
+) -> Response:
+    """Webhook do Google Drive — recebe notificações de mudanças."""
+    if settings.webhook_token and x_goog_channel_token != settings.webhook_token:
+        raise HTTPException(status_code=403, detail="token inválido")
+
+    if x_goog_resource_state == "sync":
+        # Ping de verificação inicial — nada a processar
+        return Response(status_code=200)
+
+    # Processa mudanças em background
+    background_tasks.add_task(_processar_mudancas)
+    return Response(status_code=202)
+
+
+async def _processar_mudancas() -> None:
+    """Processa mudanças detectadas pelo webhook."""
+    if app_state.page_token is None:
+        log.warning("Webhook chegou sem page_token inicial — ignorando.")
+        return
+
+    try:
+        folder_ids = [
+            app_state.pastas_monitoradas[i] for i in range(1, 5)
+            if app_state.pastas_monitoradas[i]
+        ]
+        novos, proximo_token = await asyncio.to_thread(
+            drive_client.list_new_files_since_token, app_state.page_token, folder_ids
+        )
+        app_state.page_token = proximo_token
+
+        if not novos:
+            log.info("Webhook recebido, nenhum PDF novo nas pastas monitoradas.")
+            return
+
+        log.info("Encontrados %d arquivos novos", len(novos))
+        total_processados = 0
+        total_renomeados = 0
+
+        for arquivo in novos:
+            file_id = arquivo["id"]
+            file_name = arquivo["name"]
+            folder_id = arquivo["folder_id"]
+
+            # Determinar pasta número (1-4)
+            folder_num = None
+            for num, fid in app_state.pastas_monitoradas.items():
+                if fid == folder_id:
+                    folder_num = num
+                    break
+
+            if folder_num is None:
+                log.warning("Pasta desconhecida: %s", folder_id)
+                continue
+
+            total_processados += 1
+            if processar_arquivo(file_id, file_name, folder_num):
+                total_renomeados += 1
+
+        if total_renomeados > 0:
+            await asyncio.to_thread(
+                notificar_sucesso_ciclo, total_processados, total_renomeados
+            )
+
+    except Exception:
+        log.exception("Erro ao processar mudanças")
+        await asyncio.to_thread(notificar_erro_autenticacao)

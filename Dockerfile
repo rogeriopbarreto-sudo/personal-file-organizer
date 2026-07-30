@@ -12,5 +12,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copiar código como package
 COPY . app/
 
-# Rodar como worker (loop infinito, sem porta exposta)
-CMD ["python", "-m", "app"]
+# Expor porta 8000 pro webhook do Drive
+EXPOSE 8000
+
+# Rodar FastAPI via uvicorn
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
