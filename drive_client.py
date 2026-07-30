@@ -91,6 +91,7 @@ def list_new_files_since_token(
     svc = _service()
     novos: list[dict] = []
     token = page_token
+    log.debug("list_new_files_since_token: procurando em pastas %s", folder_ids)
     while token:
         resp = (
             svc.changes()
@@ -101,18 +102,39 @@ def list_new_files_since_token(
             )
             .execute()
         )
+        changes_encontrados = len(resp.get("changes", []))
+        log.debug("Mudanças detectadas: %d", changes_encontrados)
+
         for change in resp.get("changes", []):
             f = change.get("file")
-            if not f or change.get("removed") or f.get("trashed"):
+            if not f:
+                log.debug("Mudança sem arquivo, ignorando")
+                continue
+            if change.get("removed"):
+                log.debug("Arquivo %s foi removido, ignorando", f.get("name"))
+                continue
+            if f.get("trashed"):
+                log.debug("Arquivo %s está na lixeira, ignorando", f.get("name"))
                 continue
             if f.get("mimeType") != "application/pdf":
+                log.debug("Arquivo %s não é PDF (tipo: %s), ignorando", f.get("name"), f.get("mimeType"))
                 continue
+
             # Verificar se está em uma das pastas monitoradas
             file_parents = f.get("parents") or []
+            log.debug("Arquivo %s está em pastas: %s", f.get("name"), file_parents)
+
+            encontrado = False
             for folder_id in folder_ids:
                 if folder_id in file_parents:
+                    log.info("Arquivo encontrado: %s (pasta %s)", f.get("name"), folder_id)
                     novos.append({"id": f["id"], "name": f["name"], "folder_id": folder_id})
+                    encontrado = True
                     break
+
+            if not encontrado:
+                log.debug("Arquivo %s não está em nenhuma pasta monitorada", f.get("name"))
+
         if "nextPageToken" in resp:
             token = resp["nextPageToken"]
         else:
