@@ -29,15 +29,15 @@ def extrair_texto_pdf(pdf_bytes: bytes, primeira_pagina_so: bool = False) -> str
             ["pdftotext"] + flags + ["-", "-"],
             input=pdf_bytes,
             capture_output=True,
-            text=True,
+            text=False,
             timeout=10,
         )
 
         if result.returncode != 0:
-            log.warning("pdftotext retornou código %d: %s", result.returncode, result.stderr)
+            log.warning("pdftotext retornou código %d: %s", result.returncode, result.stderr.decode("utf-8", errors="ignore"))
             return ""
 
-        return result.stdout
+        return result.stdout.decode("utf-8", errors="ignore")
 
     except FileNotFoundError:
         log.error("pdftotext não encontrado — instalar poppler-utils")
