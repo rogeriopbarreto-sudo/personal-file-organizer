@@ -23,7 +23,7 @@ from contextlib import asynccontextmanager
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Response
 
 from . import drive_client as drive
-from . import notifier, state
+from . import gastos, notifier, state
 from .config import settings
 from .llm_fallback import completar_campos
 from .parser import PdfProtegido, determinar_nome_novo, valida_padrão_final
@@ -90,26 +90,61 @@ def _mapa_pastas() -> dict[str, tuple[int, str | None]]:
 # ============================================================================
 
 
+def _avisar_gastos(
+    file_id: str, nome: str, pasta_id: str, numero: int, banco: str | None, md5: str
+) -> None:
+    """Avisa o worker do dashboard de gastos (só Pasta 04, nunca quebra o fluxo).
+
+    Precisa de um registro no cache para guardar o "já notificado" — arquivo que
+    chegou pronto (nome já no padrão final) pode ainda não ter um.
+    """
+    if numero != 4 or not banco or not gastos.habilitado():
+        return
+    try:
+        gerenciador = get_state_manager()
+        if gerenciador.get(file_id) is None:
+            gerenciador.registrar(
+                file_id, nome, numero, state.SUCESSO, motivo="já no padrão", md5=md5
+            )
+        gastos.avisar_worker(
+            numero, banco, file_id, nome, pasta_id, md5, settings.dry_run
+        )
+    except Exception:
+        log.exception("Falha no hook do worker de gastos para %s", nome)
+
+
 def _processar(
-    file_id: str, nome_atual: str, pasta_id: str, numero: int, banco: str | None
+    file_id: str,
+    nome_atual: str,
+    pasta_id: str,
+    numero: int,
+    banco: str | None,
+    md5: str = "",
 ) -> bool:
     """Processa um arquivo. Retorna True se renomeou (ou simulou o rename)."""
     gerenciador = get_state_manager()
     simulacao = settings.dry_run
 
-    # Já está no padrão final → nada a fazer (idempotência).
+    # Já está no padrão final → nada a renomear (idempotência). O worker de
+    # gastos ainda pode não conhecer o arquivo, então o hook roda mesmo assim.
     if valida_padrão_final(numero, nome_atual):
         log.info("Já no padrão final, ignorando: %s", nome_atual)
         gerenciador.registrar(
-            file_id, nome_atual, numero, state.SUCESSO, motivo="já no padrão"
+            file_id, nome_atual, numero, state.SUCESSO, motivo="já no padrão", md5=md5
         )
+        _avisar_gastos(file_id, nome_atual, pasta_id, numero, banco, md5)
         return False
 
     if numero == 4 and not banco:
         log.warning("Arquivo na raiz da Pasta 04, sem banco: %s", nome_atual)
         notifier.notificar_banco_desconhecido(nome_atual)
         gerenciador.registrar(
-            file_id, nome_atual, numero, state.SEM_DADOS, motivo="banco desconhecido"
+            file_id,
+            nome_atual,
+            numero,
+            state.SEM_DADOS,
+            motivo="banco desconhecido",
+            md5=md5,
         )
         return False
 
@@ -119,7 +154,9 @@ def _processar(
         pdf = drive.download_pdf(file_id)
     except Exception as e:
         log.exception("Falha ao baixar %s", nome_atual)
-        gerenciador.registrar(file_id, nome_atual, numero, state.ERRO, motivo=str(e)[:200])
+        gerenciador.registrar(
+            file_id, nome_atual, numero, state.ERRO, motivo=str(e)[:200], md5=md5
+        )
         notifier.notificar_erro(f"download de {nome_atual}", str(e))
         return False
 
@@ -131,12 +168,19 @@ def _processar(
         log.warning("PDF protegido por senha: %s", nome_atual)
         notifier.notificar_pdf_protegido(nome_atual, numero)
         gerenciador.registrar(
-            file_id, nome_atual, numero, state.PROTEGIDO, motivo="PDF exige senha"
+            file_id,
+            nome_atual,
+            numero,
+            state.PROTEGIDO,
+            motivo="PDF exige senha",
+            md5=md5,
         )
         return False
     except Exception as e:
         log.exception("Falha ao parsear %s", nome_atual)
-        gerenciador.registrar(file_id, nome_atual, numero, state.ERRO, motivo=str(e)[:200])
+        gerenciador.registrar(
+            file_id, nome_atual, numero, state.ERRO, motivo=str(e)[:200], md5=md5
+        )
         notifier.notificar_erro(f"parsing de {nome_atual}", str(e))
         return False
 
@@ -144,12 +188,20 @@ def _processar(
         log.warning("Nenhum campo reconhecido em %s", nome_atual)
         notifier.notificar_arquivo_sem_dados(nome_atual, numero)
         gerenciador.registrar(
-            file_id, nome_atual, numero, state.SEM_DADOS, motivo="nenhum campo reconhecido"
+            file_id,
+            nome_atual,
+            numero,
+            state.SEM_DADOS,
+            motivo="nenhum campo reconhecido",
+            md5=md5,
         )
         return False
 
     if resultado.nome == nome_atual:
-        gerenciador.registrar(file_id, nome_atual, numero, state.SUCESSO, motivo="nome já correto")
+        gerenciador.registrar(
+            file_id, nome_atual, numero, state.SUCESSO, motivo="nome já correto", md5=md5
+        )
+        _avisar_gastos(file_id, nome_atual, pasta_id, numero, banco, md5)
         return False
 
     # Nunca sobrescreve: se o destino existe, ganha sufixo (2), (3)...
@@ -178,7 +230,10 @@ def _processar(
         motivo=", ".join(resultado.campos_faltando),
         nome_novo=nome_final,
         dry_run=simulacao,
+        md5=md5,
     )
+    # Extrato da Pasta 04 renomeado: o dashboard de gastos precisa saber.
+    _avisar_gastos(file_id, nome_final, pasta_id, numero, banco, md5)
     return True
 
 
@@ -193,7 +248,8 @@ def _varrer_tudo(mapa: dict[str, tuple[int, str | None]]) -> None:
     Roda no boot: as notificações do Drive só valem a partir do momento em que o
     canal é registrado, então um arquivo que chegou com o serviço fora do ar
     nunca seria visto. Arquivos já no padrão final são descartados antes de
-    qualquer download, então a varredura é barata.
+    qualquer download, então a varredura é barata — passam só pelo hook do
+    worker de gastos, que é um teste em memória quando o aviso já foi dado.
     """
     gerenciador = get_state_manager()
     log.info("Varredura completa das pastas monitoradas")
@@ -201,11 +257,19 @@ def _varrer_tudo(mapa: dict[str, tuple[int, str | None]]) -> None:
     for pasta_id, (numero, banco) in mapa.items():
         for arquivo in drive.listar_pdfs(pasta_id):
             if valida_padrão_final(numero, arquivo.name):
+                # Nada a renomear — mas o worker de gastos pode ainda não
+                # conhecer o arquivo (primeiro boot com o hook) ou ter estado
+                # fora do ar na vez anterior. O aviso é idempotente.
+                _avisar_gastos(
+                    arquivo.id, arquivo.name, pasta_id, numero, banco, arquivo.md5
+                )
                 continue
             if not gerenciador.precisa_processar(arquivo.id, settings.dry_run):
                 continue
             try:
-                if _processar(arquivo.id, arquivo.name, pasta_id, numero, banco):
+                if _processar(
+                    arquivo.id, arquivo.name, pasta_id, numero, banco, arquivo.md5
+                ):
                     estado.renomeados += 1
             except Exception as e:
                 estado.ultimo_erro = traceback.format_exc()
@@ -249,7 +313,14 @@ def _varrer(completa: bool = False) -> None:
             continue
 
         try:
-            if _processar(file_id, arquivo["name"], pasta_id, numero, banco):
+            if _processar(
+                file_id,
+                arquivo["name"],
+                pasta_id,
+                numero,
+                banco,
+                arquivo.get("md5", ""),
+            ):
                 estado.renomeados += 1
         except Exception as e:
             estado.ultimo_erro = traceback.format_exc()
@@ -314,6 +385,7 @@ async def _renovar_canal_periodicamente() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    gastos.log_configuracao()
     problemas = settings.validar()
     if problemas:
         log.error("Configuração incompleta: %s", ", ".join(problemas))

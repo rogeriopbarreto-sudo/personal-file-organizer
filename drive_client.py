@@ -56,6 +56,8 @@ class DriveFile:
     name: str
     mime_type: str = ""
     created_time: str = ""
+    # Muda quando o conteúdo muda — usado como chave de idempotência.
+    md5: str = ""
 
 
 # ============================================================================
@@ -114,7 +116,8 @@ def listar_mudancas(page_token: str) -> tuple[list[dict], str]:
                 pageSize=200,
                 fields=(
                     "nextPageToken,newStartPageToken,"
-                    "changes(fileId,removed,file(id,name,parents,mimeType,trashed))"
+                    "changes(fileId,removed,"
+                    "file(id,name,parents,mimeType,trashed,md5Checksum))"
                 ),
             )
             .execute()
@@ -131,6 +134,7 @@ def listar_mudancas(page_token: str) -> tuple[list[dict], str]:
                     "id": arquivo["id"],
                     "name": arquivo["name"],
                     "parents": arquivo.get("parents") or [],
+                    "md5": arquivo.get("md5Checksum") or "",
                 }
             )
 
@@ -186,7 +190,10 @@ def listar_pdfs(folder_id: str) -> list[DriveFile]:
                     q=f"'{_escapa(folder_id)}' in parents and trashed=false "
                     f"and mimeType='{MIME_PDF}'",
                     spaces="drive",
-                    fields="nextPageToken,files(id,name,mimeType,createdTime)",
+                    fields=(
+                        "nextPageToken,"
+                        "files(id,name,mimeType,createdTime,md5Checksum)"
+                    ),
                     pageSize=200,
                     pageToken=page_token,
                 )
@@ -199,6 +206,7 @@ def listar_pdfs(folder_id: str) -> list[DriveFile]:
                         name=f["name"],
                         mime_type=f.get("mimeType", ""),
                         created_time=f.get("createdTime", ""),
+                        md5=f.get("md5Checksum", "") or "",
                     )
                 )
             page_token = resp.get("nextPageToken")

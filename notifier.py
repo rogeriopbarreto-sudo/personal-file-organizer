@@ -120,6 +120,16 @@ def notificar_banco_desconhecido(nome_arquivo: str) -> None:
     )
 
 
+def notificar_gastos_falhou(nome_arquivo: str, detalhe: str) -> None:
+    """O worker do dashboard de gastos não respondeu — o rename já foi feito."""
+    tg_send(
+        f"📉 Pasta 4 — <b>worker de gastos não respondeu</b> para:\n"
+        f"<code>{_esc(nome_arquivo)}</code>\n"
+        f"<code>{_esc(detalhe[:200])}</code>\n\n"
+        f"O arquivo foi renomeado normalmente; só o dashboard pode estar atrasado."
+    )
+
+
 def notificar_erro(contexto: str, detalhe: str) -> None:
     """Erro inesperado durante o processamento."""
     tg_send(f"🚨 Erro em <b>{_esc(contexto)}</b>:\n<code>{_esc(detalhe[:500])}</code>")

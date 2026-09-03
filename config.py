@@ -31,6 +31,11 @@ class Settings:
     telegram_bot_token: str = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id: str = os.environ.get("TELEGRAM_CHAT_ID", "")
 
+    # Worker do dashboard de gastos: avisado depois que um extrato/fatura da
+    # Pasta 04 é renomeado. Sem o secret o hook fica desligado (no-op).
+    gastos_worker_url: str = os.environ.get("GASTOS_WORKER_URL", "https://gastos.barreto.ai")
+    gastos_process_secret: str = os.environ.get("GASTOS_PROCESS_SECRET", "")
+
     # Webhook do Drive (precisa ser HTTPS e acessível da internet)
     webhook_base_url: str = os.environ.get("WEBHOOK_BASE_URL", "")
     webhook_token: str = os.environ.get("WEBHOOK_TOKEN", "")

@@ -31,13 +31,28 @@ RAIZ = Path(
 )
 
 # (número da pasta, caminho relativo, nome do banco)
-CASOS = [
+CASOS_FIXOS = [
     (1, "01_BTG Notas de Corretagem", None),
     (2, "02_Relatorio de Performance", None),
     (3, "03_Extrato Investimentos", None),
-    (4, "04_BTG Extratos Banking/BTG", "BTG"),
-    (4, "04_BTG Extratos Banking/Itau", "Itau"),
 ]
+
+PASTA_04 = "04_BTG Extratos Banking"
+
+
+def casos() -> list[tuple[int, str, str | None]]:
+    """Casos a testar, com as subpastas de banco descobertas — não listadas.
+
+    O serviço faz o mesmo em runtime (`drive.listar_subpastas`) e tira o banco
+    do nome da subpasta, então um banco novo (Bradesco, Nubank) entra no teste
+    sozinho, sem mexer aqui.
+    """
+    lista = list(CASOS_FIXOS)
+    raiz_04 = RAIZ / PASTA_04
+    if raiz_04.is_dir():
+        for sub in sorted(p for p in raiz_04.iterdir() if p.is_dir()):
+            lista.append((4, f"{PASTA_04}/{sub.name}", sub.name))
+    return lista
 
 
 def main() -> int:
@@ -47,7 +62,7 @@ def main() -> int:
         return 2
 
     ok = falhas = pulados = 0
-    for numero, relativo, banco in CASOS:
+    for numero, relativo, banco in casos():
         pasta = RAIZ / relativo
         if not pasta.is_dir():
             print(f"!! ausente: {pasta}")

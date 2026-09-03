@@ -19,6 +19,7 @@ No boot também roda uma **varredura completa** das pastas, para recuperar o que
 - **`DRY_RUN` não "queima" arquivos.** O cache marca o registro como simulação, então ao desligar o `DRY_RUN` os arquivos são renomeados de verdade.
 - **Banco vem da subpasta.** Na Pasta 04 o banco é o nome da subpasta (`BTG`, `Itau`), não um palpite pelo nome do arquivo. Subpasta nova passa a funcionar sozinha.
 - **PDF com senha** vira aviso no Telegram, não erro silencioso.
+- **Hook do dashboard de gastos.** Depois que um extrato da Pasta 04 fica com o nome final, o serviço chama `POST $GASTOS_WORKER_URL/process` para o dashboard reprocessar o PDF. Vale só para a Pasta 04, é idempotente (chave `file_id` + `md5`, guardada no mesmo cache, então restart não re-notifica) e **nunca quebra o rename**: worker fora do ar vira log + aviso no Telegram. Sem `GASTOS_PROCESS_SECRET` o hook é no-op, com uma linha de log no boot.
 
 ## Padrões de nome
 
@@ -42,6 +43,11 @@ Copiar `.env.example` para `.env`. Obrigatórias:
 - `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`
 
 Opcionais: `DRY_RUN`, `WEBHOOK_DEBOUNCE_SECONDS`, `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`, `USAR_LLM_FALLBACK`, `STATE_DIR`, `LOG_LEVEL`.
+
+Hook do dashboard de gastos (Pasta 04):
+
+- `GASTOS_WORKER_URL` — base do worker; o padrão é `https://gastos.barreto.ai`
+- `GASTOS_PROCESS_SECRET` — segredo enviado no header `X-Process-Secret`. **Sem ele o hook fica desligado.**
 
 ## Endpoints
 
@@ -70,10 +76,13 @@ Para o webhook funcionar local é preciso um túnel HTTPS público (ex.: `ngrok 
 ## Testes
 
 ```bash
-python app/tests/test_regressao_parser.py
+python app/tests/test_regressao_parser.py   # parser vs. PDFs reais
+python app/tests/test_hook_gastos.py        # hook do dashboard de gastos
 ```
 
-Roda o parser contra os PDFs reais já renomeados e compara com o nome atual de cada arquivo — que é o ground truth. Exige a pasta do Drive sincronizada localmente (ou `PFO_PASTA_RAIZ` apontando para ela).
+O primeiro roda o parser contra os PDFs reais já renomeados e compara com o nome atual de cada arquivo — que é o ground truth. Exige a pasta do Drive sincronizada localmente (ou `PFO_PASTA_RAIZ` apontando para ela); as subpastas de banco da Pasta 04 são descobertas, não listadas.
+
+O segundo não precisa de PDF nem de credencial: o POST no worker e o Telegram viram espiões. Ambos também rodam sob `pytest`.
 
 ## Estrutura
 
@@ -84,7 +93,8 @@ Roda o parser contra os PDFs reais já renomeados e compara com o nome atual de 
 | `parser.py` | Extração determinística por pasta (sem rede — testável offline) |
 | `llm_fallback.py` | Último recurso via Anthropic, com validação de formato |
 | `notifier.py` | Telegram (stdlib), com anti-flood |
-| `state.py` | Cache persistente do que já foi processado |
+| `state.py` | Cache persistente do que já foi processado (e do que já foi avisado ao worker de gastos) |
+| `gastos.py` | Hook pós-rename da Pasta 04 → worker do dashboard de gastos |
 | `main.py` | FastAPI, webhook, lock/debounce e orquestração |
 
 ## Problemas comuns
