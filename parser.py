@@ -441,6 +441,46 @@ _MESES_PT = {
     "setembro": "09", "outubro": "10", "novembro": "11", "dezembro": "12",
 }
 
+# Abreviação de 3 letras usada pelo Nubank ("03 AGO 2026"), maiúscula no PDF
+# mas comparada em minúsculo.
+_MESES_ABREV_PT = {
+    "jan": "01", "fev": "02", "mar": "03", "abr": "04",
+    "mai": "05", "jun": "06", "jul": "07", "ago": "08",
+    "set": "09", "out": "10", "nov": "11", "dez": "12",
+}
+
+_RE_DATA_DMY = re.compile(r"(\d{2})/(\d{2})/(\d{4})")
+_RE_DATA_DM = re.compile(r"(\d{2})/(\d{2})(?!/)")
+_RE_DATA_MON_ANO = re.compile(r"\b(\d{2})\s+([A-Za-z]{3})\s+(\d{4})\b")
+_RE_DATA_MON = re.compile(r"\b(\d{2})\s+([A-Za-z]{3})\b")
+
+
+def _extrai_venc(linha: str) -> tuple[str, str | None] | None:
+    """Tenta ler (mês, ano) de uma linha com data de vencimento.
+
+    Aceita "DD/MM/YYYY", "DD/MM", "DD MON YYYY" e "DD MON" — a última dupla é
+    a abreviação de mês em português usada pelo Nubank ("03 AGO 2026"). `ano`
+    vem `None` quando a linha só tem dia e mês. Retorna `None` se não achar
+    nenhuma data reconhecível.
+    """
+    m = _RE_DATA_DMY.search(linha)
+    if m:
+        return m.group(2), m.group(3)
+
+    m = _RE_DATA_MON_ANO.search(linha)
+    if m and m.group(2).lower() in _MESES_ABREV_PT:
+        return _MESES_ABREV_PT[m.group(2).lower()], m.group(3)
+
+    m = _RE_DATA_DM.search(linha)
+    if m:
+        return m.group(2), None
+
+    m = _RE_DATA_MON.search(linha)
+    if m and m.group(2).lower() in _MESES_ABREV_PT:
+        return _MESES_ABREV_PT[m.group(2).lower()], None
+
+    return None
+
 
 @dataclass
 class ExtratoBank:
@@ -452,10 +492,13 @@ class ExtratoBank:
 def parse_banking(texto: str) -> ExtratoBank:
     """Parser comum de extrato/fatura bancária.
 
-    Cobre os formatos vistos em ambos os bancos:
-      - "Vencimento: DD/MM/YYYY"          → ano-mês direto
+    Cobre os formatos vistos nos bancos já integrados:
+      - "Vencimento: DD/MM/YYYY"                  → ano-mês direto
       - "Vencimento: DD/MM" + "fatura de <mês> de <ano>"
-      - "Período de DD/MM/YYYY a DD/MM/YYYY" → extrato multi-mês
+      - "Data de vencimento: DD MON YYYY" (Nubank) → ano-mês direto
+      - Rótulo "Vencimento" numa linha e a data (DD/MM/YYYY ou DD/MM) na
+        linha seguinte (Bradesco)
+      - "Período de DD/MM/YYYY a DD/MM/YYYY"       → extrato multi-mês
     """
     if not texto.strip():
         return ExtratoBank()
@@ -466,17 +509,20 @@ def parse_banking(texto: str) -> ExtratoBank:
     venc_mes = venc_ano = None
     fatura_mes = fatura_ano = None
 
-    for linha in linhas:
+    for i, linha in enumerate(linhas):
         norm = _chave(linha)
 
         if venc_mes is None and "vencimento" in norm:
-            m = re.search(r"(\d{2})/(\d{2})/(\d{4})", linha)
-            if m:
-                venc_mes, venc_ano = m.group(2), m.group(3)
-            else:
-                m = re.search(r"(\d{2})/(\d{2})(?!/)", linha)
-                if m:
-                    venc_mes = m.group(2)
+            achado = _extrai_venc(linha)
+            if achado is None:
+                # Rótulo e data em linhas separadas (Bradesco): olha só a
+                # próxima linha não vazia.
+                for prox in linhas[i + 1:]:
+                    if prox.strip():
+                        achado = _extrai_venc(prox)
+                        break
+            if achado:
+                venc_mes, venc_ano = achado
 
         if fatura_mes is None:
             m = re.search(r"fatura de (\w+) de (\d{4})", norm)

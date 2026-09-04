@@ -11,6 +11,10 @@ Como rodar (precisa da pasta do Drive sincronizada e do pdftotext no PATH):
 Para apontar para outro lugar:
 
     PFO_PASTA_RAIZ="D:/..." python app/tests/test_regressao_parser.py
+
+Além do `main()` acima (que exige a pasta do Drive), este arquivo também tem
+testes de unidade de `parse_banking` com trechos sintéticos — esses rodam sob
+`pytest` em qualquer máquina, sem precisar de PDF nem de `PFO_PASTA_RAIZ`.
 """
 from __future__ import annotations
 
@@ -53,6 +57,88 @@ def casos() -> list[tuple[int, str, str | None]]:
         for sub in sorted(p for p in raiz_04.iterdir() if p.is_dir()):
             lista.append((4, f"{PASTA_04}/{sub.name}", sub.name))
     return lista
+
+
+# ============================================================================
+# Testes — unidade (parse_banking), com trechos sintéticos
+# ============================================================================
+#
+# Não usam PDF nem a pasta do Drive — rodam em qualquer máquina, sem
+# PFO_PASTA_RAIZ. Cobrem os formatos de vencimento por banco, incluídos aqui
+# porque test_regressao_parser.py é o arquivo que já reúne os casos da
+# Pasta 04.
+
+
+def test_parse_banking_nubank_data_por_extenso_abreviada():
+    """Nubank: "Data de vencimento: 03 AGO 2026" — sem "/", mês abreviado.
+
+    O trecho inclui, mais abaixo, a mesma frase de declaração legal real
+    ("...até a data de vencimento da fatura de dezembro de 2025") que faz o
+    fallback `fatura de <mês> de <ano>` casar com prosa não relacionada. O
+    vencimento explícito tem que ganhar dessa decoy.
+    """
+    texto = """
+    NUBANK
+
+    Olá, Fulano.
+    Esta é a sua fatura de
+    agosto, no valor de
+    R$ 1.234,56
+
+    Data de vencimento: 03 AGO 2026
+    Limite total do cartão de crédito: R$ 10.000,00
+
+    Ao autorizar o pagamento parcial, você reconhece que os encargos
+    incidem até a data de vencimento da fatura de dezembro de 2025.
+    """
+    bank = P.parse_banking(texto)
+    assert bank.ano_mes == "2026-08"
+
+
+def test_parse_banking_bradesco_rotulo_e_data_em_linhas_separadas():
+    """Bradesco: rótulo " Vencimento" numa linha, a data na linha seguinte."""
+    texto = """
+    BANCO BRADESCO S.A.
+
+                                                       Total da fatura  Vencimento
+     Vencimento
+    01/09/2026
+
+    Valor total da fatura: R$ 987,65
+    """
+    bank = P.parse_banking(texto)
+    assert bank.ano_mes == "2026-09"
+
+
+def test_parse_banking_vencimento_completo_ganha_do_fallback_fatura():
+    """Formato já coberto (BTG/Itaú): "Vencimento: DD/MM/YYYY" na mesma linha."""
+    texto = """
+    Vencimento: 05/08/2026
+    ...
+    conforme consta da fatura de julho de 2025, este débito é anterior.
+    """
+    bank = P.parse_banking(texto)
+    assert bank.ano_mes == "2026-08"
+
+
+def test_parse_banking_vencimento_sem_ano_usa_fatura():
+    """Formato já coberto (BTG/Itaú): "Vencimento: DD/MM" + "fatura de <mês> de <ano>"."""
+    texto = """
+    Vencimento: 05/08
+    ...
+    Esta é a fatura de agosto de 2026.
+    """
+    bank = P.parse_banking(texto)
+    assert bank.ano_mes == "2026-08"
+
+
+def test_parse_banking_periodo_multimes():
+    """Formato já coberto: extrato "Período de DD/MM/YYYY a DD/MM/YYYY"."""
+    texto = """
+    Período de 01/07/2026 a 31/08/2026
+    """
+    bank = P.parse_banking(texto)
+    assert (bank.periodo_inicio, bank.periodo_fim) == ("26-07", "26-08")
 
 
 def main() -> int:
