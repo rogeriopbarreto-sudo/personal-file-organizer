@@ -25,6 +25,12 @@ SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 MIME_PASTA = "application/vnd.google-apps.folder"
 MIME_PDF = "application/pdf"
+# A Pasta 04 também aceita extrato de conta corrente em CSV (export do
+# internet banking, ex.: Bradesco) — só ela; as demais pastas são PDF-only.
+# `text/plain` e `application/vnd.ms-excel` entram porque é o que o navegador
+# (ou o Excel, se o arquivo passar por lá antes do upload) costuma carimbar
+# num `.csv` — o Drive não normaliza pro `text/csv` "correto".
+MIMES_CSV = ("text/csv", "application/csv", "text/plain", "application/vnd.ms-excel")
 
 
 def _service():
@@ -98,10 +104,12 @@ def stop_watch(channel: Channel) -> None:
 
 
 def listar_mudancas(page_token: str) -> tuple[list[dict], str]:
-    """Lista os PDFs criados/alterados desde `page_token`.
+    """Lista os PDFs/CSVs criados/alterados desde `page_token`.
 
-    Retorna (lista de {id, name, parents}, próximo page_token). O filtro por
-    pasta é feito por quem chama — aqui só devolvemos os PDFs vivos.
+    Retorna (lista de {id, name, parents, md5, mime_type}, próximo page_token).
+    O filtro por pasta é feito por quem chama — aqui ainda não se sabe em qual
+    pasta o arquivo caiu, então CSV passa (só interessa se cair na Pasta 04;
+    quem chama descarta o resto).
     """
     svc = _service()
     novos: list[dict] = []
@@ -127,7 +135,8 @@ def listar_mudancas(page_token: str) -> tuple[list[dict], str]:
             arquivo = mudanca.get("file")
             if not arquivo or mudanca.get("removed") or arquivo.get("trashed"):
                 continue
-            if arquivo.get("mimeType") != MIME_PDF:
+            mime_type = arquivo.get("mimeType")
+            if mime_type != MIME_PDF and mime_type not in MIMES_CSV:
                 continue
             novos.append(
                 {
@@ -135,6 +144,7 @@ def listar_mudancas(page_token: str) -> tuple[list[dict], str]:
                     "name": arquivo["name"],
                     "parents": arquivo.get("parents") or [],
                     "md5": arquivo.get("md5Checksum") or "",
+                    "mime_type": mime_type or "",
                 }
             )
 
@@ -174,10 +184,21 @@ def listar_subpastas(folder_id: str) -> list[DriveFile]:
     return [DriveFile(id=f["id"], name=f["name"]) for f in resp.get("files", [])]
 
 
-def listar_pdfs(folder_id: str) -> list[DriveFile]:
-    """Todos os PDFs de uma pasta, mais antigos primeiro."""
+def listar_pdfs(folder_id: str, incluir_csv: bool = False) -> list[DriveFile]:
+    """Todos os PDFs (e, com `incluir_csv`, os CSVs) de uma pasta, mais antigos primeiro.
+
+    `incluir_csv` é ligado só para a Pasta 04 (extrato de conta corrente em
+    CSV) — as demais pastas continuam PDF-only.
+    """
     if not folder_id:
         return []
+
+    if incluir_csv:
+        clausula_mime = (
+            "(" + " or ".join(f"mimeType='{m}'" for m in (MIME_PDF,) + MIMES_CSV) + ")"
+        )
+    else:
+        clausula_mime = f"mimeType='{MIME_PDF}'"
 
     svc = _service()
     arquivos: list[DriveFile] = []
@@ -188,7 +209,7 @@ def listar_pdfs(folder_id: str) -> list[DriveFile]:
                 svc.files()
                 .list(
                     q=f"'{_escapa(folder_id)}' in parents and trashed=false "
-                    f"and mimeType='{MIME_PDF}'",
+                    f"and {clausula_mime}",
                     spaces="drive",
                     fields=(
                         "nextPageToken,"
@@ -279,7 +300,7 @@ def nome_sem_colisao(
 
 
 def download_pdf(file_id: str) -> bytes:
-    """Baixa o conteúdo do PDF."""
+    """Baixa o conteúdo do arquivo (PDF ou, na Pasta 04, CSV) como bytes."""
     request = _service().files().get_media(fileId=file_id)
     buffer = io.BytesIO()
     downloader = MediaIoBaseDownload(buffer, request)

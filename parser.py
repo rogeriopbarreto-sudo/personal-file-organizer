@@ -21,6 +21,11 @@ from dataclasses import dataclass, field
 
 log = logging.getLogger("file_organizer.parser")
 
+# Repetido de drive_client.py (e não importado de lá): o parser continua puro
+# e testável offline, sem depender do client do Drive.
+MIME_PDF = "application/pdf"
+_MIMES_CSV = {"text/csv", "application/csv"}
+
 
 class PdfProtegido(Exception):
     """O PDF exige senha — não é possível extrair o texto."""
@@ -554,13 +559,64 @@ def parse_banking(texto: str) -> ExtratoBank:
     return bank
 
 
-def nome_pasta_04(bank: ExtratoBank, nome_banco: str) -> tuple[str | None, list[str]]:
-    """Nome final da Pasta 04: fatura mensal ou extrato multi-mês."""
+def nome_pasta_04(
+    bank: ExtratoBank, nome_banco: str, extensao: str = "pdf"
+) -> tuple[str | None, list[str]]:
+    """Nome final da Pasta 04: fatura mensal ou extrato multi-mês.
+
+    `extensao` segue o arquivo de origem — "pdf" para fatura/extrato em PDF,
+    "csv" para o extrato de conta corrente exportado em CSV.
+    """
     if bank.ano_mes:
-        return f"{bank.ano_mes} - {nome_banco}.pdf", []
+        return f"{bank.ano_mes} - {nome_banco}.{extensao}", []
     if bank.periodo_inicio and bank.periodo_fim:
-        return f"{bank.periodo_inicio} - {bank.periodo_fim} - Banking.pdf", []
+        return f"{bank.periodo_inicio} - {bank.periodo_fim} - Banking.{extensao}", []
     return None, ["ano_mes"]
+
+
+# ----------------------------------------------------------------------------
+# Pasta 04: extrato de conta corrente em CSV (export do internet banking)
+# ----------------------------------------------------------------------------
+
+# "Filtro de resultados - Movimentação entre:  01/01/2026 e 30/06/2026"
+# (duas linhas de espaço depois dos dois-pontos, no export do Bradesco).
+# `_chave()` já tira os acentos e deixa minúsculo antes de casar.
+_RE_PERIODO_CSV = re.compile(
+    r"movimenta\w*\s+entre:?\s*(\d{2})/(\d{2})/(\d{4})\s+e\s+(\d{2})/(\d{2})/(\d{4})"
+)
+
+
+def _decode_csv(raw: bytes) -> str:
+    """Decodifica o CSV do extrato: BOM UTF-8, senão UTF-8, senão cp1252."""
+    for enc in ("utf-8-sig", "utf-8", "cp1252"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def parse_extrato_csv(texto: str) -> ExtratoBank:
+    """Extrai o período de um extrato de conta corrente em CSV.
+
+    O período só existe na linha "Filtro de resultados - Movimentação entre:
+    DD/MM/YYYY e DD/MM/YYYY" — as linhas de lançamento não trazem o período
+    completo. Um extrato de um mês só também vira "período" (não há forma de
+    fatura mensal aqui, é sempre extrato).
+    """
+    bank = ExtratoBank()
+    for linha in _linhas(texto):
+        m = _RE_PERIODO_CSV.search(_chave(linha))
+        if m:
+            d1, m1, a1, d2, m2, a2 = m.groups()
+            bank.periodo_inicio = f"{a1[-2:]}-{m1}"
+            bank.periodo_fim = f"{a2[-2:]}-{m2}"
+            break
+
+    log.info(
+        "Pasta 04 (CSV) → periodo=%s..%s", bank.periodo_inicio, bank.periodo_fim
+    )
+    return bank
 
 
 # ============================================================================
@@ -600,6 +656,7 @@ def determinar_nome_novo(
     nome_arquivo: str,
     pdf_bytes: bytes,
     completar=None,
+    mime_type: str = MIME_PDF,
 ) -> Resultado:
     """Determina o nome novo do arquivo conforme a pasta de origem.
 
@@ -608,12 +665,16 @@ def determinar_nome_novo(
     `completar` é um callback opcional `(texto, campos_faltando) -> dict` usado
     como último recurso quando a extração determinística não fecha. Fica como
     parâmetro (e não import) para o parser continuar puro e testável offline.
+
+    `mime_type` só importa para a Pasta 04: um extrato de conta corrente em
+    CSV (`text/csv`/`application/csv`) não passa pelo `pdftotext` — é
+    decodificado e parseado como texto puro, e o nome final sai com `.csv`.
     """
     if folder_num not in _CAMPOS_POR_PASTA:
         return Resultado(None, ["pasta_desconhecida"])
 
-    # Pasta 01 precisa do documento inteiro; as demais só da primeira página.
-    texto = extrair_texto_pdf(pdf_bytes, primeira_pagina_so=(folder_num != 1))
+    eh_csv = folder_num == 4 and mime_type in _MIMES_CSV
+    extensao = "csv" if eh_csv else "pdf"
 
     def monta(dados) -> tuple[str | None, list[str]]:
         if folder_num == 1:
@@ -622,21 +683,33 @@ def determinar_nome_novo(
             return nome_pasta_02(dados)
         if folder_num == 3:
             return nome_pasta_03(dados)
-        return nome_pasta_04(dados, nome_banco or "??")
+        return nome_pasta_04(dados, nome_banco or "??", extensao)
 
-    if folder_num == 1:
-        dados = parse_pasta_01(texto)
-    elif folder_num == 2:
-        dados = parse_pasta_02(texto)
-    elif folder_num == 3:
-        dados = parse_pasta_03(texto)
+    if eh_csv:
+        texto = _decode_csv(pdf_bytes)
+        dados = parse_extrato_csv(texto)
     else:
-        dados = parse_banking(texto)
+        # Pasta 01 precisa do documento inteiro; as demais só da primeira página.
+        texto = extrair_texto_pdf(pdf_bytes, primeira_pagina_so=(folder_num != 1))
+        if folder_num == 1:
+            dados = parse_pasta_01(texto)
+        elif folder_num == 2:
+            dados = parse_pasta_02(texto)
+        elif folder_num == 3:
+            dados = parse_pasta_03(texto)
+        else:
+            dados = parse_banking(texto)
 
     nome, faltando = monta(dados)
     usou_llm = False
 
-    if faltando and completar is not None:
+    # CSV nunca aciona o fallback de LLM: sem a linha de período, "sem dados"
+    # é definitivo. O fallback compartilhado manda o texto inteiro (agência,
+    # conta, todos os lançamentos) pra Anthropic API — inaceitável pra um
+    # extrato de conta corrente, e o LLM já devolveu, no passado, um nome no
+    # formato de fatura mensal que `valida_padrão_final` aceitava sem checar
+    # se fazia sentido pro CSV original.
+    if faltando and completar is not None and not eh_csv:
         preenchidos = completar(texto, faltando) or {}
         mapa = _CAMPOS_POR_PASTA[folder_num]
         for campo, valor in preenchidos.items():
@@ -664,7 +737,9 @@ _PADROES_FINAIS = {
     ),
     3: re.compile(r"^\d{4}-\d{2}" + _SUFIXO + r"\.pdf$"),
     4: re.compile(
-        r"^(?:\d{4}-\d{2} - .+|\d{2}-\d{2} - \d{2}-\d{2} - Banking)" + _SUFIXO + r"\.pdf$"
+        r"^(?:\d{4}-\d{2} - .+|\d{2}-\d{2} - \d{2}-\d{2} - Banking)"
+        + _SUFIXO
+        + r"\.(?:pdf|csv)$"
     ),
 }
 

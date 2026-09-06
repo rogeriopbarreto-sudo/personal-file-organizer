@@ -154,15 +154,20 @@ def main() -> int:
             print(f"!! ausente: {pasta}")
             continue
         print(f"\n== Pasta {numero}: {relativo}")
-        for arquivo in sorted(pasta.glob("*.pdf")):
+        arquivos = sorted(pasta.glob("*.pdf")) + sorted(pasta.glob("*.csv"))
+        for arquivo in arquivos:
             nome = arquivo.name
+            # Extensão → mimeType: só a Pasta 04 tem CSV (extrato de conta
+            # corrente); o resto é sempre PDF. `determinar_nome_novo` decide
+            # o parser certo (CSV puro vs. pdftotext) a partir desse mime.
+            mime_type = "text/csv" if arquivo.suffix.lower() == ".csv" else P.MIME_PDF
             # Só valida o que já está no padrão final — esse é o ground truth.
             if not P.valida_padrão_final(numero, nome):
                 pulados += 1
                 continue
             try:
                 obtido = P.determinar_nome_novo(
-                    numero, banco, nome, arquivo.read_bytes()
+                    numero, banco, nome, arquivo.read_bytes(), mime_type=mime_type
                 ).nome
             except P.PdfProtegido:
                 pulados += 1

@@ -120,6 +120,7 @@ def _processar(
     numero: int,
     banco: str | None,
     md5: str = "",
+    mime_type: str = drive.MIME_PDF,
 ) -> bool:
     """Processa um arquivo. Retorna True se renomeou (ou simulou o rename)."""
     gerenciador = get_state_manager()
@@ -162,7 +163,7 @@ def _processar(
 
     try:
         resultado = determinar_nome_novo(
-            numero, banco, nome_atual, pdf, completar=completar_campos
+            numero, banco, nome_atual, pdf, completar=completar_campos, mime_type=mime_type
         )
     except PdfProtegido:
         log.warning("PDF protegido por senha: %s", nome_atual)
@@ -195,6 +196,9 @@ def _processar(
             motivo="nenhum campo reconhecido",
             md5=md5,
         )
+        # Mesmo sem conseguir renomear (ex.: CSV sem a linha de período), o
+        # worker de gastos ganha o file_id e tenta parsear por conta própria.
+        _avisar_gastos(file_id, nome_atual, pasta_id, numero, banco, md5)
         return False
 
     if resultado.nome == nome_atual:
@@ -255,7 +259,8 @@ def _varrer_tudo(mapa: dict[str, tuple[int, str | None]]) -> None:
     log.info("Varredura completa das pastas monitoradas")
 
     for pasta_id, (numero, banco) in mapa.items():
-        for arquivo in drive.listar_pdfs(pasta_id):
+        # Extrato de conta corrente em CSV só é aceito na Pasta 04.
+        for arquivo in drive.listar_pdfs(pasta_id, incluir_csv=(numero == 4)):
             if valida_padrão_final(numero, arquivo.name):
                 # Nada a renomear — mas o worker de gastos pode ainda não
                 # conhecer o arquivo (primeiro boot com o hook) ou ter estado
@@ -268,7 +273,13 @@ def _varrer_tudo(mapa: dict[str, tuple[int, str | None]]) -> None:
                 continue
             try:
                 if _processar(
-                    arquivo.id, arquivo.name, pasta_id, numero, banco, arquivo.md5
+                    arquivo.id,
+                    arquivo.name,
+                    pasta_id,
+                    numero,
+                    banco,
+                    arquivo.md5,
+                    arquivo.mime_type,
                 ):
                     estado.renomeados += 1
             except Exception as e:
@@ -308,6 +319,12 @@ def _varrer(completa: bool = False) -> None:
             continue
         pasta_id, (numero, banco) = destino
 
+        # CSV só interessa na Pasta 04 — em qualquer outra é descartado aqui
+        # (o filtro de `listar_mudancas` é global, sem saber a pasta ainda).
+        mime_type = arquivo.get("mime_type", drive.MIME_PDF)
+        if numero != 4 and mime_type != drive.MIME_PDF:
+            continue
+
         if not gerenciador.precisa_processar(file_id, settings.dry_run):
             log.debug("Já processado, ignorando: %s", arquivo["name"])
             continue
@@ -320,6 +337,7 @@ def _varrer(completa: bool = False) -> None:
                 numero,
                 banco,
                 arquivo.get("md5", ""),
+                mime_type,
             ):
                 estado.renomeados += 1
         except Exception as e:
