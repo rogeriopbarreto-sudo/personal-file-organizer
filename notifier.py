@@ -111,6 +111,37 @@ def notificar_pdf_protegido(nome_arquivo: str, pasta: int) -> None:
     )
 
 
+def notificar_pdf_protegido_pasta_04(
+    nome_arquivo: str, enviado: bool, hook_desligado: str = ""
+) -> None:
+    """PDF com senha numa subpasta de banco: fica com o nome original.
+
+    Quem abre é o worker de gastos, que tem a senha de cada banco no servidor —
+    não há o que o Roger fazer, a não ser que o envio tenha falhado.
+    `hook_desligado` diz por que o aviso nem foi tentado (sem secret, DRY_RUN).
+    """
+    if hook_desligado:
+        desfecho = (
+            f"O aviso ao dashboard de gastos está desligado ({hook_desligado}); "
+            f"o arquivo não foi enviado."
+        )
+    elif enviado:
+        desfecho = (
+            "Enviado ao dashboard de gastos, que abre com a senha configurada "
+            "no servidor."
+        )
+    else:
+        desfecho = (
+            "Não chegou ao dashboard de gastos; o organizador tenta de novo no "
+            "próximo deploy ou com POST /varrer."
+        )
+    tg_send(
+        f"🔒 Pasta 4 — PDF protegido por senha, ficou com o nome original:\n"
+        f"<code>{_esc(nome_arquivo)}</code>\n\n"
+        f"{desfecho}"
+    )
+
+
 def notificar_banco_desconhecido(nome_arquivo: str) -> None:
     """Arquivo na raiz da Pasta 04, fora de uma subpasta de banco."""
     tg_send(
@@ -121,12 +152,34 @@ def notificar_banco_desconhecido(nome_arquivo: str) -> None:
 
 
 def notificar_gastos_falhou(nome_arquivo: str, detalhe: str) -> None:
-    """O worker do dashboard de gastos não respondeu — o rename já foi feito."""
+    """O worker do dashboard de gastos não respondeu — o organizador seguiu."""
     tg_send(
         f"📉 Pasta 4 — <b>worker de gastos não respondeu</b> para:\n"
         f"<code>{_esc(nome_arquivo)}</code>\n"
         f"<code>{_esc(detalhe[:200])}</code>\n\n"
-        f"O arquivo foi renomeado normalmente; só o dashboard pode estar atrasado."
+        f"O organizador seguiu normalmente; só o dashboard pode estar atrasado. "
+        f"Tenta de novo no próximo deploy ou com POST /varrer."
+    )
+
+
+def notificar_gastos_ocupado(nome_arquivo: str, tentativas: int, segundos: float) -> None:
+    """O worker ficou ocupado (409) além do teto de tentativas ou de tempo."""
+    duracao = f"{segundos / 60:.0f} min" if segundos >= 60 else f"{segundos:.0f} s"
+    tg_send(
+        f"📉 Pasta 4 — <b>worker de gastos ocupado</b> "
+        f"({tentativas} tentativas em {duracao}); desisti de avisar sobre:\n"
+        f"<code>{_esc(nome_arquivo)}</code>\n\n"
+        f"O arquivo fica pendente até o próximo deploy ou um POST /varrer."
+    )
+
+
+def notificar_pasta_04_sem_subpastas(detalhe: str) -> None:
+    """A Pasta 04 não devolveu subpasta de banco — nenhum extrato chega ao dashboard."""
+    tg_send(
+        f"🚨 Pasta 4 — <b>nenhuma subpasta de banco visível</b>:\n"
+        f"<code>{_esc(detalhe[:300])}</code>\n\n"
+        f"Sem elas nenhum extrato chega ao dashboard de gastos. Confira se a "
+        f"Pasta 04 continua compartilhada como Editor com a service account."
     )
 
 

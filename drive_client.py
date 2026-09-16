@@ -162,7 +162,11 @@ def listar_mudancas(page_token: str) -> tuple[list[dict], str]:
 
 
 def listar_subpastas(folder_id: str) -> list[DriveFile]:
-    """Subpastas diretas de uma pasta (usado para descobrir os bancos da Pasta 04)."""
+    """Subpastas diretas de uma pasta (usado para descobrir os bancos da Pasta 04).
+
+    Lança se a API falhar: uma lista vazia aqui esconderia a perda de acesso
+    à Pasta 04, e quem chama (`main._mapa_pastas`) transforma isso em alarme.
+    """
     if not folder_id:
         return []
     try:
@@ -180,7 +184,7 @@ def listar_subpastas(folder_id: str) -> list[DriveFile]:
         )
     except Exception:
         log.exception("Falha ao listar subpastas de %s", folder_id)
-        return []
+        raise
     return [DriveFile(id=f["id"], name=f["name"]) for f in resp.get("files", [])]
 
 
@@ -189,6 +193,10 @@ def listar_pdfs(folder_id: str, incluir_csv: bool = False) -> list[DriveFile]:
 
     `incluir_csv` é ligado só para a Pasta 04 (extrato de conta corrente em
     CSV) — as demais pastas continuam PDF-only.
+
+    Lança se a API falhar: uma lista vazia aqui seria indistinguível de "pasta
+    sem arquivo", e a varredura completa desligaria uma pendência sem ter
+    visto a pasta. Quem chama (`main._varrer_tudo`) segue para as outras pastas.
     """
     if not folder_id:
         return []
@@ -235,7 +243,7 @@ def listar_pdfs(folder_id: str, incluir_csv: bool = False) -> list[DriveFile]:
                 break
     except Exception:
         log.exception("Falha ao listar PDFs de %s", folder_id)
-        return []
+        raise
 
     arquivos.sort(key=lambda a: a.created_time)
     return arquivos

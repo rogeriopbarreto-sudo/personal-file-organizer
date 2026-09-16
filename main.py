@@ -18,7 +18,9 @@ import logging
 import os
 import time
 import traceback
+from collections.abc import Callable
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Response
 
@@ -40,6 +42,19 @@ RENOVAR_COM_ANTECEDENCIA_MS = 12 * 60 * 60 * 1000
 INTERVALO_CHECAGEM_CANAL_S = 60 * 60
 
 
+@dataclass
+class AvisoGastos:
+    """Um aviso ao worker de gastos esperando o fim dos renames da varredura."""
+
+    file_id: str
+    nome: str
+    pasta_id: str
+    banco: str
+    md5: str
+    # Chamado com o desfecho (o worker conhece o arquivo nesse md5?).
+    depois: Callable[[bool], None] | None = None
+
+
 class Estado:
     """Estado compartilhado do processo."""
 
@@ -52,6 +67,18 @@ class Estado:
         self.varreduras = 0
         self.renomeados = 0
         self.ultimo_erro: str | None = None
+        # Alarme de "Pasta 04 sem subpastas de banco" já enviado: o webhook
+        # dispara varreduras o tempo todo e o Telegram não pode repetir.
+        self.alarme_subpastas = False
+        # Enquanto a listagem das subpastas falha, mudanças nelas são puladas
+        # e o page_token avança. Quando a listagem voltar, uma varredura
+        # completa recupera o que passou.
+        self.completa_ao_voltar = False
+        # Avisos ao worker de gastos juntados durante uma varredura e enviados
+        # no fim dela, ainda com o lock: a espera por um 409 não atrasa os
+        # renames da mesma varredura, mas segura a próxima (ver `_varrer`).
+        # None fora de uma varredura: o aviso sai na hora.
+        self.avisos_adiados: list[AvisoGastos] | None = None
 
 
 estado = Estado()
@@ -79,7 +106,32 @@ def _mapa_pastas() -> dict[str, tuple[int, str | None]]:
         if folder_id:
             mapa[folder_id] = (numero, None)
 
-    for subpasta in drive.listar_subpastas(settings.drive_folder_04):
+    if not settings.drive_folder_04:
+        return mapa
+
+    # Sem subpasta de banco nenhum extrato chega ao worker de gastos. Erro de
+    # API ou lista vazia (ex.: a service account perdeu o acesso) viram um
+    # alarme só, até as subpastas voltarem.
+    try:
+        subpastas = drive.listar_subpastas(settings.drive_folder_04)
+        problema = "" if subpastas else "a listagem voltou vazia"
+    except Exception as e:
+        subpastas, problema = [], f"erro ao listar: {e}"
+
+    if not problema:
+        if estado.alarme_subpastas:
+            log.info("Subpastas de banco da Pasta 04 visíveis de novo: %d", len(subpastas))
+        estado.alarme_subpastas = False
+    else:
+        # Mudança numa subpasta invisível agora é pulada, e o page_token
+        # avança: sem isso ela se perderia até o próximo deploy.
+        estado.completa_ao_voltar = True
+        if not estado.alarme_subpastas:
+            estado.alarme_subpastas = True
+            log.error("Pasta 04 sem subpastas de banco: %s", problema)
+            notifier.notificar_pasta_04_sem_subpastas(problema)
+
+    for subpasta in subpastas:
         mapa[subpasta.id] = (4, subpasta.name)
 
     return mapa
@@ -90,13 +142,31 @@ def _mapa_pastas() -> dict[str, tuple[int, str | None]]:
 # ============================================================================
 
 
+def _hook_gastos_desligado() -> str:
+    """Por que o aviso ao worker de gastos não sai ('' se ele está ligado)."""
+    if not gastos.habilitado():
+        return "GASTOS_WORKER_URL/GASTOS_PROCESS_SECRET não configurados"
+    if settings.dry_run:
+        return "DRY_RUN"
+    return ""
+
+
 def _avisar_gastos(
-    file_id: str, nome: str, pasta_id: str, numero: int, banco: str | None, md5: str
+    file_id: str,
+    nome: str,
+    pasta_id: str,
+    numero: int,
+    banco: str | None,
+    md5: str,
+    depois: Callable[[bool], None] | None = None,
 ) -> None:
     """Avisa o worker do dashboard de gastos (só Pasta 04, nunca quebra o fluxo).
 
     Precisa de um registro no cache para guardar o "já notificado" — arquivo que
     chegou pronto (nome já no padrão final) pode ainda não ter um.
+
+    Dentro de uma varredura o aviso entra na fila e sai depois dos renames;
+    fora dela, sai na hora. `depois` recebe o desfecho.
     """
     if numero != 4 or not banco or not gastos.habilitado():
         return
@@ -106,11 +176,45 @@ def _avisar_gastos(
             gerenciador.registrar(
                 file_id, nome, numero, state.SUCESSO, motivo="já no padrão", md5=md5
             )
-        gastos.avisar_worker(
-            numero, banco, file_id, nome, pasta_id, md5, settings.dry_run
-        )
     except Exception:
         log.exception("Falha no hook do worker de gastos para %s", nome)
+        return
+    aviso = AvisoGastos(file_id, nome, pasta_id, banco, md5, depois)
+    if estado.avisos_adiados is not None:
+        estado.avisos_adiados.append(aviso)
+    else:
+        _enviar_aviso_gastos(aviso)
+
+
+def _enviar_aviso_gastos(aviso: AvisoGastos) -> bool:
+    """Faz o aviso de verdade. True se o worker conhece o arquivo nesse md5."""
+    try:
+        gastos.avisar_worker(
+            4, aviso.banco, aviso.file_id, aviso.nome, aviso.pasta_id, aviso.md5,
+            settings.dry_run,
+        )
+        enviado = get_state_manager().ja_notificou_gastos(aviso.file_id, aviso.md5)
+    except Exception:
+        log.exception("Falha no hook do worker de gastos para %s", aviso.nome)
+        enviado = False
+    if aviso.depois:
+        try:
+            aviso.depois(enviado)
+        except Exception:
+            log.exception("Falha depois do aviso ao worker de gastos: %s", aviso.nome)
+    return enviado
+
+
+def _enviar_avisos_adiados() -> None:
+    """Esvazia a fila da varredura. Mesmo arquivo e md5 só é tentado uma vez."""
+    avisos, estado.avisos_adiados = estado.avisos_adiados or [], None
+    desfechos: dict[tuple[str, str], bool] = {}
+    for aviso in avisos:
+        chave = (aviso.file_id, aviso.md5)
+        if chave not in desfechos:
+            desfechos[chave] = _enviar_aviso_gastos(aviso)
+        elif aviso.depois:
+            aviso.depois(desfechos[chave])
 
 
 def _processar(
@@ -122,7 +226,13 @@ def _processar(
     md5: str = "",
     mime_type: str = drive.MIME_PDF,
 ) -> bool:
-    """Processa um arquivo. Retorna True se renomeou (ou simulou o rename)."""
+    """Processa um arquivo. Retorna True se renomeou (ou simulou o rename).
+
+    Na Pasta 04 (subpasta de banco) o worker de gastos é avisado em TODA saída:
+    renomeado, sem dados, com senha, erro de download/leitura ou falha no
+    rename. O worker baixa o arquivo, tem a senha do banco e não depende do
+    nome — o rename daqui não é pré-requisito do aviso. Pastas 01–03 nunca avisam.
+    """
     gerenciador = get_state_manager()
     simulacao = settings.dry_run
 
@@ -144,7 +254,7 @@ def _processar(
             nome_atual,
             numero,
             state.SEM_DADOS,
-            motivo="banco desconhecido",
+            motivo=state.MOTIVO_BANCO_DESCONHECIDO,
             md5=md5,
         )
         return False
@@ -159,6 +269,7 @@ def _processar(
             file_id, nome_atual, numero, state.ERRO, motivo=str(e)[:200], md5=md5
         )
         notifier.notificar_erro(f"download de {nome_atual}", str(e))
+        _avisar_gastos(file_id, nome_atual, pasta_id, numero, banco, md5)
         return False
 
     try:
@@ -167,7 +278,6 @@ def _processar(
         )
     except PdfProtegido:
         log.warning("PDF protegido por senha: %s", nome_atual)
-        notifier.notificar_pdf_protegido(nome_atual, numero)
         gerenciador.registrar(
             file_id,
             nome_atual,
@@ -176,6 +286,22 @@ def _processar(
             motivo="PDF exige senha",
             md5=md5,
         )
+        if numero == 4 and banco:
+            # Fica com o nome original; quem abre é o worker, com a senha do
+            # banco. O Telegram sai com o desfecho real do aviso.
+            desligado = _hook_gastos_desligado()
+            if desligado:
+                notifier.notificar_pdf_protegido_pasta_04(nome_atual, False, desligado)
+            _avisar_gastos(
+                file_id, nome_atual, pasta_id, numero, banco, md5,
+                depois=None if desligado else (
+                    lambda enviado: notifier.notificar_pdf_protegido_pasta_04(
+                        nome_atual, enviado
+                    )
+                ),
+            )
+        else:
+            notifier.notificar_pdf_protegido(nome_atual, numero)
         return False
     except Exception as e:
         log.exception("Falha ao parsear %s", nome_atual)
@@ -183,6 +309,7 @@ def _processar(
             file_id, nome_atual, numero, state.ERRO, motivo=str(e)[:200], md5=md5
         )
         notifier.notificar_erro(f"parsing de {nome_atual}", str(e))
+        _avisar_gastos(file_id, nome_atual, pasta_id, numero, banco, md5)
         return False
 
     if resultado.nome is None:
@@ -208,14 +335,31 @@ def _processar(
         _avisar_gastos(file_id, nome_atual, pasta_id, numero, banco, md5)
         return False
 
-    # Nunca sobrescreve: se o destino existe, ganha sufixo (2), (3)...
-    nome_final = drive.nome_sem_colisao(pasta_id, resultado.nome, ignorar_id=file_id)
+    try:
+        # Nunca sobrescreve: se o destino existe, ganha sufixo (2), (3)...
+        nome_final = drive.nome_sem_colisao(pasta_id, resultado.nome, ignorar_id=file_id)
 
-    if simulacao:
-        log.info("[DRY_RUN] Renomearia: %s → %s", nome_atual, nome_final)
-    else:
-        drive.rename_file(file_id, nome_final)
-        log.info("Renomeado: %s → %s", nome_atual, nome_final)
+        if simulacao:
+            log.info("[DRY_RUN] Renomearia: %s → %s", nome_atual, nome_final)
+        else:
+            drive.rename_file(file_id, nome_final)
+            log.info("Renomeado: %s → %s", nome_atual, nome_final)
+    except Exception as e:
+        # O rename falhou, mas o worker de gastos não precisa dele. O registro
+        # guarda o "já avisado" e, como ERRO_RENAME, não impede a próxima
+        # varredura de tentar o rename de novo. A exceção segue para quem
+        # chamou (log, Telegram e /health, como antes).
+        if numero == 4 and banco:
+            gerenciador.registrar(
+                file_id,
+                nome_atual,
+                numero,
+                state.ERRO_RENAME,
+                motivo=f"rename: {e}"[:200],
+                md5=md5,
+            )
+            _avisar_gastos(file_id, nome_atual, pasta_id, numero, banco, md5)
+        raise
 
     if resultado.campos_faltando:
         notifier.notificar_campos_faltando(
@@ -246,30 +390,45 @@ def _processar(
 # ============================================================================
 
 
-def _varrer_tudo(mapa: dict[str, tuple[int, str | None]]) -> None:
+def _varrer_tudo(mapa: dict[str, tuple[int, str | None]]) -> bool:
     """Percorre as pastas inteiras, não só as mudanças recentes.
 
     Roda no boot: as notificações do Drive só valem a partir do momento em que o
     canal é registrado, então um arquivo que chegou com o serviço fora do ar
-    nunca seria visto. Arquivos já no padrão final são descartados antes de
-    qualquer download, então a varredura é barata — passam só pelo hook do
-    worker de gastos, que é um teste em memória quando o aviso já foi dado.
+    nunca seria visto. Arquivos já no padrão final ou já registrados são
+    descartados antes de qualquer download, então a varredura é barata —
+    passam só pelo hook do worker de gastos, que é um teste em memória quando
+    o aviso já foi dado.
+
+    Retorna True só se TODAS as pastas foram listadas. Uma pasta que falha é
+    pulada (log) e as outras seguem.
     """
     gerenciador = get_state_manager()
     log.info("Varredura completa das pastas monitoradas")
+    listou_tudo = True
 
     for pasta_id, (numero, banco) in mapa.items():
-        # Extrato de conta corrente em CSV só é aceito na Pasta 04.
-        for arquivo in drive.listar_pdfs(pasta_id, incluir_csv=(numero == 4)):
-            if valida_padrão_final(numero, arquivo.name):
+        try:
+            # Extrato de conta corrente em CSV só é aceito na Pasta 04.
+            arquivos = drive.listar_pdfs(pasta_id, incluir_csv=(numero == 4))
+        except Exception:
+            listou_tudo = False
+            continue  # o erro já foi logado; as outras pastas seguem
+        for arquivo in arquivos:
+            if valida_padrão_final(numero, arquivo.name) or not (
+                gerenciador.precisa_processar(
+                    arquivo.id, settings.dry_run, em_subpasta_de_banco=(numero == 4 and bool(banco))
+                )
+            ):
                 # Nada a renomear — mas o worker de gastos pode ainda não
-                # conhecer o arquivo (primeiro boot com o hook) ou ter estado
-                # fora do ar na vez anterior. O aviso é idempotente.
+                # conhecer o arquivo: primeiro boot com o hook, PROTEGIDO ou
+                # SEM_DADOS de antes, aviso que falhou, arquivo movido da raiz
+                # para a subpasta (o banco é a subpasta ATUAL). Idempotente por
+                # file_id + md5; no-op fora das subpastas da Pasta 04. Arquivo
+                # que ainda vai a `_processar` é avisado lá, depois do rename.
                 _avisar_gastos(
                     arquivo.id, arquivo.name, pasta_id, numero, banco, arquivo.md5
                 )
-                continue
-            if not gerenciador.precisa_processar(arquivo.id, settings.dry_run):
                 continue
             try:
                 if _processar(
@@ -287,14 +446,44 @@ def _varrer_tudo(mapa: dict[str, tuple[int, str | None]]) -> None:
                 log.exception("Erro inesperado em %s", arquivo.name)
                 notifier.notificar_erro(arquivo.name, str(e))
 
+    return listou_tudo
+
 
 def _varrer(completa: bool = False) -> None:
-    """Lê as mudanças desde o último page_token e processa os PDFs novos."""
+    """Lê as mudanças desde o último page_token e processa os PDFs novos.
+
+    Os avisos ao worker de gastos são juntados durante a varredura e enviados
+    no fim dela, ainda com o lock preso. O que isso garante: a espera por um
+    worker ocupado (409) não atrasa os renames DESTA varredura, que saem todos
+    antes do primeiro aviso. O que não garante: um arquivo que chega enquanto a
+    fila espera só é processado na varredura seguinte, depois que ela esvaziar.
+    Se a varredura quebrar, a fila já montada é enviada mesmo assim (finally).
+    """
+    estado.avisos_adiados = []
+    try:
+        _varrer_renomeando(completa)
+    finally:
+        _enviar_avisos_adiados()
+
+
+def _varrer_renomeando(completa: bool) -> None:
     gerenciador = get_state_manager()
     mapa = _mapa_pastas()
 
+    # A listagem das subpastas da Pasta 04 falhou numa varredura anterior e
+    # voltou agora: o que mudou nelas nesse meio-tempo foi pulado.
+    recuperacao = estado.completa_ao_voltar and not estado.alarme_subpastas
+    if recuperacao:
+        log.info("Subpastas da Pasta 04 de volta — varredura completa de recuperação")
+        completa = True
+
     if completa:
-        _varrer_tudo(mapa)
+        # A pendência só se desliga quando a varredura viu todas as pastas; se
+        # alguma não listou (inclusive no boot), a próxima notificação refaz.
+        if not _varrer_tudo(mapa):
+            estado.completa_ao_voltar = True
+        elif recuperacao:
+            estado.completa_ao_voltar = False
 
     novos, proximo_token = drive.listar_mudancas(estado.page_token)
     estado.page_token = proximo_token
@@ -325,8 +514,16 @@ def _varrer(completa: bool = False) -> None:
         if numero != 4 and mime_type != drive.MIME_PDF:
             continue
 
-        if not gerenciador.precisa_processar(file_id, settings.dry_run):
+        if not gerenciador.precisa_processar(
+            file_id, settings.dry_run, em_subpasta_de_banco=(numero == 4 and bool(banco))
+        ):
             log.debug("Já processado, ignorando: %s", arquivo["name"])
+            # Mesmo motivo da varredura completa: o worker pode não ter
+            # recebido (PROTEGIDO, SEM_DADOS, aviso que falhou, arquivo que
+            # veio da raiz, conteúdo novo). No-op fora da Pasta 04.
+            _avisar_gastos(
+                file_id, arquivo["name"], pasta_id, numero, banco, arquivo.get("md5", "")
+            )
             continue
 
         try:

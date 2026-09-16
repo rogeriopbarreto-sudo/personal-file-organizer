@@ -23,6 +23,13 @@ INCOMPLETO = "incompleto"  # renomeado, mas com campos "??"
 SEM_DADOS = "sem_dados"
 PROTEGIDO = "protegido"
 ERRO = "erro"
+# O rename falhou (ex.: 503 passageiro do Drive). Diferente de ERRO, a próxima
+# varredura tenta de novo; o registro existe só para guardar o aviso ao worker.
+ERRO_RENAME = "erro_rename"
+
+# Motivo gravado quando o arquivo caiu na raiz da Pasta 04, fora de uma
+# subpasta de banco. Se ele aparecer depois numa subpasta, é processado de novo.
+MOTIVO_BANCO_DESCONHECIDO = "banco desconhecido"
 
 # Marca usada quando o Drive não devolveu o md5 do arquivo. Existe para que um
 # md5 vazio nunca seja confundido com "ainda não notificado".
@@ -146,17 +153,29 @@ class StateManager:
             registro.md5 = md5
         self._salvar()
 
-    def precisa_processar(self, file_id: str, dry_run_atual: bool) -> bool:
+    def precisa_processar(
+        self, file_id: str, dry_run_atual: bool, em_subpasta_de_banco: bool = False
+    ) -> bool:
         """Diz se o arquivo ainda precisa ser processado.
 
         Um registro feito em modo simulação não conta como processado quando o
         serviço passa a rodar de verdade — senão nada seria renomeado ao sair
-        do DRY_RUN.
+        do DRY_RUN. Rename que falhou é tentado de novo, e arquivo registrado
+        como "banco desconhecido" (raiz da Pasta 04) é processado quando
+        aparece numa subpasta de banco.
         """
         registro = self.registros.get(file_id)
         if registro is None:
             return True
         if registro.dry_run and not dry_run_atual:
+            return True
+        if registro.status == ERRO_RENAME:
+            return True
+        if (
+            em_subpasta_de_banco
+            and registro.status == SEM_DADOS
+            and registro.motivo == MOTIVO_BANCO_DESCONHECIDO
+        ):
             return True
         return False
 
