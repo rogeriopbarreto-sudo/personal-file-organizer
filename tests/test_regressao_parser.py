@@ -10,7 +10,11 @@ Como rodar (precisa da pasta do Drive sincronizada e do pdftotext no PATH):
 
 Para apontar para outro lugar:
 
-    PFO_PASTA_RAIZ="D:/..." python app/tests/test_regressao_parser.py
+    PFO_PASTA_RAIZ="D:/..." PFO_PASTA_04_RAIZ="D:/..." python app/tests/test_regressao_parser.py
+
+As Pastas 01–03 ficam em `03_Documentos/05_Comprovantes Op Fiannceira`; a Pasta
+04 mudou em 16/09/2026 para `06_Claude/14_Personal Finance/14_Personal Finance
+Resources` (mesmo ID no Drive, então o serviço não percebe a mudança).
 
 Além do `main()` acima (que exige a pasta do Drive), este arquivo também tem
 testes de unidade de `parse_banking` com trechos sintéticos — esses rodam sob
@@ -33,6 +37,13 @@ RAIZ = Path(
         Path.home() / "My Drive" / "03_Documentos" / "05_Comprovantes Op Fiannceira",
     )
 )
+RAIZ_04 = Path(
+    os.environ.get(
+        "PFO_PASTA_04_RAIZ",
+        Path.home() / "My Drive" / "06_Claude" / "14_Personal Finance"
+        / "14_Personal Finance Resources",
+    )
+)
 
 # (número da pasta, caminho relativo, nome do banco)
 CASOS_FIXOS = [
@@ -52,7 +63,7 @@ def casos() -> list[tuple[int, str, str | None]]:
     sozinho, sem mexer aqui.
     """
     lista = list(CASOS_FIXOS)
-    raiz_04 = RAIZ / PASTA_04
+    raiz_04 = RAIZ_04 / PASTA_04
     if raiz_04.is_dir():
         for sub in sorted(p for p in raiz_04.iterdir() if p.is_dir()):
             lista.append((4, f"{PASTA_04}/{sub.name}", sub.name))
@@ -149,7 +160,7 @@ def main() -> int:
 
     ok = falhas = pulados = 0
     for numero, relativo, banco in casos():
-        pasta = RAIZ / relativo
+        pasta = (RAIZ_04 if numero == 4 else RAIZ) / relativo
         if not pasta.is_dir():
             print(f"!! ausente: {pasta}")
             continue
