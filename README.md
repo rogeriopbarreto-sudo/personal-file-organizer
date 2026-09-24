@@ -18,7 +18,7 @@ No boot também roda uma **varredura completa** das pastas, para recuperar o que
 - **Nunca sobrescreve.** Se o nome de destino já existe, ganha sufixo `(2)`, `(3)`...
 - **`DRY_RUN` não "queima" arquivos.** O cache marca o registro como simulação, então ao desligar o `DRY_RUN` os arquivos são renomeados de verdade.
 - **Banco vem da subpasta.** Na Pasta 04 o banco é o nome da subpasta (`BTG`, `Itau`), não um palpite pelo nome do arquivo. Subpasta nova passa a funcionar sozinha. Se a Pasta 04 não devolver nenhuma subpasta (erro de API ou lista vazia), sai **um** alarme no Telegram até elas voltarem; quando voltam, roda uma varredura completa para recuperar o que mudou nelas nesse meio-tempo. Arquivo que caiu na raiz e depois foi movido para uma subpasta é processado (e renomeado) de novo.
-- **PDF com senha** vira aviso no Telegram, não erro silencioso. Nas Pastas 01–03 o aviso pede para remover a senha; numa subpasta de banco da Pasta 04 o arquivo fica com o nome original e vai para o dashboard, que abre com a senha configurada no servidor.
+- **PDF com senha** vira aviso no Telegram, não erro silencioso. Nas Pastas 01–03 o aviso pede para remover a senha. Numa subpasta de banco da Pasta 04 o organizador tenta a senha do banco (`<BANCO>_PDF_PASSWORD`, ex.: `ITAU_PDF_PASSWORD` para a subpasta `Itau`) e renomeia normalmente; o arquivo continua com senha, só o nome muda. Sem a env ou com a senha errada, fica com o nome original e vai para o dashboard, que abre com a senha configurada no servidor.
 - **Hook do dashboard de gastos.** Todo arquivo de subpasta de banco da Pasta 04 chega ao worker (`POST $GASTOS_WORKER_URL/process`), renomeado ou não: com senha, sem dados reconhecidos, com erro de download/leitura ou falha no rename. As varreduras também avisam o que já estava registrado e nunca chegou. Dentro de uma varredura os avisos são juntados e enviados **depois** dos renames dela, ainda com o lock: um worker ocupado não atrasa os renames da mesma varredura, mas um arquivo que chega durante a espera fica para a varredura seguinte. Rename que falha (ex.: 503 do Drive) não impede o aviso nem a nova tentativa de rename na varredura seguinte. Vale só para a Pasta 04, é idempotente (chave `file_id` + `md5`, guardada no mesmo cache, então restart não re-notifica) e **nunca quebra o rename**: worker fora do ar vira log + aviso no Telegram, e o arquivo fica pendente até o próximo deploy ou `POST /varrer` (ou até mudar de novo no Drive). Worker ocupado (409, um job por vez) não é falha: o aviso espera `finished_at` em `GET /jobs/{id}` (se a consulta falhar, backoff) e tenta de novo, e só desiste — com um Telegram — depois de 8 tentativas ou 11 min. Sem `GASTOS_PROCESS_SECRET` o hook é no-op, com uma linha de log no boot.
 
 ## Padrões de nome
@@ -48,6 +48,8 @@ Hook do dashboard de gastos (Pasta 04):
 
 - `GASTOS_WORKER_URL` — base do worker; o padrão é `https://gastos.barreto.ai`
 - `GASTOS_PROCESS_SECRET` — segredo enviado no header `X-Process-Secret`. **Sem ele o hook fica desligado.**
+
+Senhas dos PDFs da Pasta 04 (opcionais, uma por subpasta de banco): `<BANCO>_PDF_PASSWORD`, com o nome da subpasta sem acento, maiúsculo e só letras/dígitos — `ITAU_PDF_PASSWORD`, `BTG_PDF_PASSWORD`, `NUBANK_PDF_PASSWORD`. Mesma convenção do inbox e do worker de gastos. A senha nunca vai para log.
 
 ## Endpoints
 

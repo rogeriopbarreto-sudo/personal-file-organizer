@@ -26,7 +26,7 @@ from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Response
 
 from . import drive_client as drive
 from . import gastos, notifier, state
-from .config import settings
+from .config import senha_pdf, settings
 from .llm_fallback import completar_campos
 from .parser import PdfProtegido, determinar_nome_novo, valida_padrão_final
 from .state import get_state_manager
@@ -273,8 +273,11 @@ def _processar(
         return False
 
     try:
+        # Fatura com senha (Itaú, BTG) abre com <BANCO>_PDF_PASSWORD; sem a env
+        # ou com senha errada, cai no ramo PROTEGIDO abaixo, como antes.
         resultado = determinar_nome_novo(
-            numero, banco, nome_atual, pdf, completar=completar_campos, mime_type=mime_type
+            numero, banco, nome_atual, pdf, completar=completar_campos, mime_type=mime_type,
+            senha=senha_pdf(banco) if numero == 4 else None,
         )
     except PdfProtegido:
         log.warning("PDF protegido por senha: %s", nome_atual)

@@ -2,11 +2,30 @@
 from __future__ import annotations
 
 import os
+import re
+import unicodedata
 from dataclasses import dataclass
 
 
 def _bool_env(nome: str, padrao: bool = False) -> bool:
     return os.environ.get(nome, str(padrao)).strip().lower() in ("true", "1", "yes", "sim")
+
+
+def env_senha_pdf(banco: str) -> str:
+    """Nome da env var com a senha dos PDFs do banco: "Itau" → ITAU_PDF_PASSWORD.
+
+    Mesma convenção do inbox e do worker de gastos. O banco é o nome da
+    subpasta da Pasta 04, sem acento, maiúsculo e só com letras e dígitos.
+    """
+    sem_acento = unicodedata.normalize("NFKD", banco).encode("ascii", "ignore").decode()
+    return re.sub(r"[^A-Z0-9]", "", sem_acento.upper()) + "_PDF_PASSWORD"
+
+
+def senha_pdf(banco: str | None) -> str | None:
+    """Senha dos PDFs do banco, lida da env na hora (None se não houver)."""
+    if not banco:
+        return None
+    return os.environ.get(env_senha_pdf(banco), "").strip() or None
 
 
 @dataclass(frozen=True)

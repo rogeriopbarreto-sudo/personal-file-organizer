@@ -50,19 +50,25 @@ def _decode(raw: bytes) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
-def extrair_texto_pdf(pdf_bytes: bytes, primeira_pagina_so: bool = False) -> str:
+def extrair_texto_pdf(
+    pdf_bytes: bytes, primeira_pagina_so: bool = False, senha: str | None = None
+) -> str:
     """Extrai texto do PDF via pdftotext, preservando o layout das tabelas.
 
     Escreve o PDF num arquivo temporário em vez de usar stdin: o poppler aceita
     `-` como entrada, mas o Xpdf (usado em algumas máquinas de desenvolvimento)
     não — passar o caminho funciona nos dois.
 
-    Se primeira_pagina_so=True, extrai só a primeira página.
-    Retorna string vazia se falhar.
+    Se primeira_pagina_so=True, extrai só a primeira página. `senha` é a senha
+    de usuário do PDF (`-upw`); nunca vai para log.
+    Retorna string vazia se falhar; levanta `PdfProtegido` se a senha faltar
+    ou não abrir.
     """
     flags = ["-layout", "-enc", "UTF-8"]
     if primeira_pagina_so:
         flags.extend(["-f", "1", "-l", "1"])
+    if senha:
+        flags.extend(["-upw", senha])
 
     fd, caminho = tempfile.mkstemp(suffix=".pdf", prefix="pfo_")
     try:
@@ -657,6 +663,7 @@ def determinar_nome_novo(
     pdf_bytes: bytes,
     completar=None,
     mime_type: str = MIME_PDF,
+    senha: str | None = None,
 ) -> Resultado:
     """Determina o nome novo do arquivo conforme a pasta de origem.
 
@@ -669,6 +676,9 @@ def determinar_nome_novo(
     `mime_type` só importa para a Pasta 04: um extrato de conta corrente em
     CSV (`text/csv`/`application/csv`) não passa pelo `pdftotext` — é
     decodificado e parseado como texto puro, e o nome final sai com `.csv`.
+
+    `senha` é a senha do banco (Pasta 04). Só é usada se o PDF se recusar a
+    abrir sem ela; se também não abrir, `PdfProtegido` sobe como antes.
     """
     if folder_num not in _CAMPOS_POR_PASTA:
         return Resultado(None, ["pasta_desconhecida"])
@@ -690,7 +700,13 @@ def determinar_nome_novo(
         dados = parse_extrato_csv(texto)
     else:
         # Pasta 01 precisa do documento inteiro; as demais só da primeira página.
-        texto = extrair_texto_pdf(pdf_bytes, primeira_pagina_so=(folder_num != 1))
+        so_primeira = folder_num != 1
+        try:
+            texto = extrair_texto_pdf(pdf_bytes, primeira_pagina_so=so_primeira)
+        except PdfProtegido:
+            if not senha:
+                raise
+            texto = extrair_texto_pdf(pdf_bytes, primeira_pagina_so=so_primeira, senha=senha)
         if folder_num == 1:
             dados = parse_pasta_01(texto)
         elif folder_num == 2:
